@@ -239,8 +239,68 @@ export class WeixinAdapter {
     await this.transport.stop().catch(() => {});
   }
 
+  isPeerSession(session) {
+    let current = session;
+    for (let depth = 0; depth < 6 && current; depth += 1) {
+      if (this.agents.has(current.id) || this.conversations.findBySessionId(current.id)) {
+        return true;
+      }
+      const parent = current.header?.parentSession;
+      if (!parent) return false;
+      const parentSession = this.ctx.sessions?.get?.(parent);
+      if (parentSession) {
+        current = parentSession;
+      } else {
+        return Boolean(this.agents.has(parent) || this.conversations.findBySessionId(parent));
+      }
+    }
+    return false;
+  }
+
+  resolvePeerRecord(request) {
+    let session = request?.agent?.session;
+    let sessionId = String(request?.agent?.id ?? session?.id ?? '');
+    const originalSessionId = sessionId;
+    let delegated = false;
+    for (let depth = 0; depth < 6 && sessionId; depth += 1) {
+      const record = this.agents.get(sessionId);
+      if (record) {
+        return {
+          record: {
+            accountId: record.accountId,
+            userId: record.userId,
+            sessionId,
+          },
+          conversation: record.conversation,
+          originalSessionId,
+          delegated,
+        };
+      }
+      const found = this.conversations.findBySessionId(sessionId);
+      if (found) {
+        return {
+          record: {
+            accountId: found.accountId,
+            userId: found.userId,
+            sessionId,
+          },
+          conversation: found.conversation,
+          originalSessionId,
+          delegated,
+        };
+      }
+      const parent = session?.header?.parentSession ?? this.ctx.sessions?.get?.(sessionId)?.header?.parentSession;
+      if (!parent) return undefined;
+      delegated = true;
+      sessionId = parent;
+      session = this.ctx.sessions?.get?.(parent);
+    }
+    return undefined;
+  }
+
   onSessionEvent(session, event) {
-    const ours = this.agents.has(session.id);
+    const ours =
+      (event.type === 'tool/call' || event.type === 'tool/result') && this.isPeerSession(session);
     if (ours && event.type === 'tool/call') {
       const callId = String(event.data?.callId ?? '');
       if (callId) {
@@ -330,6 +390,9 @@ export class WeixinAdapter {
     const text = [
       '【DSH 权限申请】',
       `会话：${redactForWeChat(title)}`,
+      entry.delegated
+        ? `来源：子 Agent 会话 ${String(entry.originSessionId).slice(0, 20)}`
+        : '',
       `工具：${redactForWeChat(entry.request.toolName ?? entry.cachedName ?? 'unknown')}`,
       '动作：',
       action,
@@ -378,24 +441,9 @@ export class WeixinAdapter {
   }
 
   async onApprovalRequest(request, next) {
-    const sessionId = String(request?.agent?.id ?? '');
-    let record = this.agents.get(sessionId);
-    let conversation;
-    if (record) {
-      conversation = record.conversation;
-    } else {
-      const found = this.conversations.findBySessionId(sessionId);
-      if (found) {
-        record = {
-          accountId: found.accountId,
-          userId: found.userId,
-          sessionId,
-        };
-        conversation = found.conversation;
-      }
-    }
-    if (!record?.accountId || !record?.userId) return next();
-
+    const resolved = this.resolvePeerRecord(request);
+    if (!resolved?.record?.accountId || !resolved?.record?.userId) return next();
+    const { record, conversation, originalSessionId, delegated } = resolved;
     const key = this.peerKey(record.accountId, record.userId);
     let resolve;
     const promise = new Promise((done) => {
@@ -408,7 +456,9 @@ export class WeixinAdapter {
       next,
       record,
       conversation,
-      sessionId,
+      sessionId: record.sessionId,
+      originSessionId: originalSessionId,
+      delegated,
       resolve,
       arguments: cached?.arguments,
       cachedName: cached?.name,

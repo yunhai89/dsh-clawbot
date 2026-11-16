@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3 — 2026-11-16
+
+- Route subagent approval requests to the owning WeChat conversation by walking `parentSession`
+- Cache child-agent `tool/call` arguments for approval prompts
+- Mark delegated approvals with a `子 Agent` source line
+- Add a subagent approval routing test
+
 ## 0.1.2 — 2026-11-16
 
 Tool approval adaptation.

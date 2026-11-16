@@ -374,6 +374,58 @@ test('approval prompts include tool arguments and redact secrets', async () => {
   await adapter.stop();
 });
 
+test('subagent approvals route to the owning WeChat conversation', async () => {
+  const sent = [];
+  const env = makeEnv();
+  env.transport.send = async (message) => {
+    sent.push(message);
+    return { messageId: 'approval-child' };
+  };
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: { agentPreset: 'standard' },
+    transport: env.transport,
+    stateDir: `/tmp/opencode/clawbot-adapter-approval-child-${process.pid}`,
+    workspace: `/tmp/opencode/clawbot-adapter-approval-child-${process.pid}/workspace`,
+    log: () => {},
+  });
+  await adapter.start();
+  adapter.agents.set('root', {
+    sessionId: 'root',
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    agent: { id: 'root', status: 'running', session: { id: 'root' } },
+    conversation: { title: '主会话' },
+    handle: null,
+  });
+  const childSession = {
+    id: 'child',
+    header: { parentSession: 'root' },
+  };
+  adapter.onSessionEvent(childSession, {
+    type: 'tool/call',
+    data: { callId: 'c-child', name: 'bash', arguments: '{"command":"make test"}' },
+  });
+
+  const outcome = adapter.onApprovalRequest(
+    { agent: { id: 'child', session: childSession }, toolName: 'bash', callId: 'c-child' },
+    async () => 'unavailable',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /子 Agent/);
+  assert.match(sent[0].text, /make test/);
+
+  await adapter.handleInbound({
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    messageId: 'approval-child-1',
+    text: '/reject',
+  });
+  assert.equal(await outcome, 'rejected');
+  await adapter.stop();
+});
+
 test('approval requests are queued per chat instead of failing the second request', async () => {
   const sent = [];
   const env = makeEnv();
