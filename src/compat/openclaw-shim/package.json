@@ -1,0 +1,21 @@
+{
+  "name": "openclaw",
+  "version": "2026.8.1",
+  "description": "Minimal OpenClaw plugin-SDK host shim for embedding @tencent-weixin/openclaw-weixin outside OpenClaw.",
+  "type": "module",
+  "exports": {
+    "./plugin-sdk/account-id": "./lib/account-id.js",
+    "./plugin-sdk/config-mutation": "./lib/config-mutation.js",
+    "./plugin-sdk/temp-path": "./lib/temp-path.js",
+    "./plugin-sdk/channel-ingress-runtime": "./lib/channel-ingress-runtime.js",
+    "./plugin-sdk/channel-outbound": "./lib/channel-outbound.js",
+    "./plugin-sdk/hook-runtime": "./lib/hook-runtime.js",
+    "./plugin-sdk/plugin-runtime": "./lib/plugin-runtime.js",
+    "./plugin-sdk/core": "./lib/empty.js",
+    "./plugin-sdk/channel-contract": "./lib/empty.js",
+    "./plugin-sdk/channel-config-schema": "./lib/empty.js",
+    "./plugin-sdk/channel-message": "./lib/channel-outbound.js",
+    "./plugin-sdk/reply-runtime": "./lib/empty.js",
+    "./plugin-sdk/plugin-entry": "./lib/empty.js"
+  }
+}

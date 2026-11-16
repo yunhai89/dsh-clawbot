@@ -1,0 +1,12 @@
+# dsh-clawbot: WeChat ClawBot channel for DeepSeek Harness.
+# The row is intentionally thin: runtime state (accounts, QR login, sessions)
+# lives under $DSH_HOME/clawbot, not in the profile patch.
+- insert:
+    - id: clawbot
+      name: dsh-clawbot
+      config:
+        enabled: true
+        agentPreset: standard
+        permissionPreset: workspace-write
+        replyProgress: true
+        autoStart: true

@@ -1,0 +1,78 @@
+{
+  "name": "dsh-clawbot",
+  "version": "0.1.0",
+  "description": "WeChat ClawBot (Tencent iLink) channel plugin for DeepSeek Harness (DSH): QR login, per-user sessions, model/workspace switching, and an OpenClaw host compatibility layer.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "wechat",
+    "weixin",
+    "clawbot",
+    "ilink",
+    "ilink-bot",
+    "openclaw",
+    "chatbot",
+    "ai-agent",
+    "cordis",
+    "channel",
+    "wechat-bot"
+  ],
+  "author": "yunhai89",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yunhai89/dsh-clawbot.git"
+  },
+  "homepage": "https://github.com/yunhai89/dsh-clawbot#readme",
+  "bugs": {
+    "url": "https://github.com/yunhai89/dsh-clawbot/issues"
+  },
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "dependencies": {
+    "@tencent-weixin/openclaw-weixin": "2.4.10",
+    "openclaw": "file:src/compat/openclaw-shim",
+    "qrcode": "^1.5.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.1.0",
+    "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.4.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    },
+    "engines": {
+      "dsh": ">=0.2.2-rc.1 <0.4.0-0"
+    }
+  }
+}
