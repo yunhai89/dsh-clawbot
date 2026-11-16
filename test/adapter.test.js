@@ -174,7 +174,7 @@ test('A adapter forwards an approval prompt and accepts /approve', async () => {
     messageId: 'm3',
     text: '/approve',
   });
-  assert.deepEqual(reply, { text: '已同意这一次操作。' });
+  assert.deepEqual(reply, { text: '已允许这一次操作。' });
   assert.equal(await outcome, 'allowed-once');
   await adapter.stop();
 });
@@ -317,6 +317,117 @@ test('large inbound files stream into attachments instead of buffering', async (
   });
   assert.equal(streamCalls, 1);
   assert.ok(content.some((part) => part.type === 'file' && part.attachment.attachmentId === 'streamed'));
+});
+
+test('approval prompts include tool arguments and redact secrets', async () => {
+  const sent = [];
+  const env = makeEnv();
+  env.transport.send = async (message) => {
+    sent.push(message);
+    return { messageId: 'approval-args' };
+  };
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: { agentPreset: 'standard' },
+    transport: env.transport,
+    stateDir: `/tmp/opencode/clawbot-adapter-approval-${process.pid}`,
+    workspace: `/tmp/opencode/clawbot-adapter-approval-${process.pid}/workspace`,
+    log: () => {},
+  });
+  await adapter.start();
+  adapter.agents.set('s1', {
+    sessionId: 's1',
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    agent: { id: 's1', status: 'running', session: { id: 's1' } },
+    handle: null,
+  });
+  adapter.onSessionEvent(
+    { id: 's1' },
+    {
+      type: 'tool/call',
+      data: {
+        callId: 'c1',
+        name: 'bash',
+        arguments: JSON.stringify({ command: 'API_KEY=super-secret npm test' }),
+      },
+    },
+  );
+
+  const outcome = adapter.onApprovalRequest(
+    { agent: { id: 's1' }, toolName: 'bash', callId: 'c1', reason: 'run tests' },
+    async () => 'unavailable',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /npm test/);
+  assert.match(sent[0].text, /\*\*\*/);
+  assert.doesNotMatch(sent[0].text, /super-secret/);
+
+  await adapter.handleInbound({
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    messageId: 'approval-args-1',
+    text: '/reject',
+  });
+  assert.equal(await outcome, 'rejected');
+  await adapter.stop();
+});
+
+test('approval requests are queued per chat instead of failing the second request', async () => {
+  const sent = [];
+  const env = makeEnv();
+  env.transport.send = async (message) => {
+    sent.push(message);
+    return { messageId: 'approval-queue' };
+  };
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: { agentPreset: 'standard' },
+    transport: env.transport,
+    stateDir: `/tmp/opencode/clawbot-adapter-approval-queue-${process.pid}`,
+    workspace: `/tmp/opencode/clawbot-adapter-approval-queue-${process.pid}/workspace`,
+    log: () => {},
+  });
+  await adapter.start();
+  adapter.agents.set('s1', {
+    sessionId: 's1',
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    agent: { id: 's1', status: 'running', session: { id: 's1' } },
+    handle: null,
+  });
+
+  const first = adapter.onApprovalRequest(
+    { agent: { id: 's1' }, toolName: 'bash', reason: 'first' },
+    async () => 'unavailable',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const second = adapter.onApprovalRequest(
+    { agent: { id: 's1' }, toolName: 'bash', reason: 'second' },
+    async () => 'unavailable',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(sent.filter((message) => message.text.includes('【DSH 权限申请】')).length, 1);
+
+  await adapter.handleInbound({
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    messageId: 'approval-queue-1',
+    text: '/approve',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(sent.filter((message) => message.text.includes('【DSH 权限申请】')).length, 2);
+
+  await adapter.handleInbound({
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    messageId: 'approval-queue-2',
+    text: '/reject',
+  });
+  assert.equal(await first, 'allowed-once');
+  assert.equal(await second, 'rejected');
+  await adapter.stop();
 });
 
 test('A adapter handles /whoami without creating an agent', async () => {

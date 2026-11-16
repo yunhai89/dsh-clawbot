@@ -58,7 +58,7 @@
 - **会话管理**：`/new`、`/list`、`/use`、`/title`
 - **模型切换**：`/model` 查看和切换当前会话模型
 - **工作区管理**：`/workspace` 列出、切换、创建 DSH 工作区
-- **微信内审批**：工具需要审批时推送到微信，回复 `/approve` 或 `/reject`
+- **微信内审批**：工具需要权限时推送到微信，显示工具、命令/文件路径和原因，自动脱敏 token；回复 `/approve` 允许一次或 `/reject` 拒绝，多个审批按聊天排队
 - **图片/文件入站**：图片走 DSH attachment（需要视觉模型），其他文件走附件路径
 - **登录白名单**：扫码者自动写入 allowlist，其他微信用户默认拒绝
 - **多账号隔离**：按 `accountId + userId` 隔离会话
@@ -386,7 +386,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-clawbot/debug/inbound \
 
 - **DSH Connection 鉴权**：`/api/dsh-clawbot/*` 精确路由不在普通 `/api` 桥里，因此额外调用 DSH Connection 的 `requestRejection()`；未登录的本地进程也无法扫码、登出或读状态。
 - **扫码者白名单（fail-closed）**：扫码成功后，扫码者的 `ilink_user_id` 自动写入 allowlist；账号没有 allowlist 且没有记录 owner 时，插件拒绝启动该账号，而不是退回“允许所有人”。
-- **审批转发**：默认 `workspace-write`，越界操作需要微信 `/approve`；超时按拒绝处理。
+- **审批转发**：默认 `workspace-write`，越界操作需要微信 `/approve`；审批卡片会带上工具名、实际命令/文件路径和原因，并对 token、API key、password 等做脱敏；同一聊天的多个审批会排队，超时按拒绝处理。
 - **工作区绑定**：DSH Session 的 sandbox / 写权限根目录绑定创建时的 `cwd`；切换工作区会开新会话。可用 `workspaceRoots` 限制允许的工作区根目录。
 - **状态目录权限**：`$DSH_HOME/clawbot` 为 `700`；token、allowlist、context token、会话映射、SQLite 引用缓存均为 `600`，并每 5 分钟自动校正一次。
 - **SSRF 防护**：二维码轮询的 `baseUrl` 只允许腾讯 `https://*.weixin.qq.com` / `https://*.qq.com`，拒绝内网地址和带凭据 URL。
@@ -455,6 +455,10 @@ DSH 的 sandbox / 写权限根目录绑定 Session 创建时的 `cwd`。为了�
 - 图片：会下载、解密、存入 DSH attachment；需要视觉模型才能“看见”
 - 文件/视频：保存为附件
 - 语音：优先使用腾讯返回的转写文本；没有转写时保存为文件
+
+### 工具申请权限时微信里会看到什么？
+
+会收到一条「DSH 权限申请」，包含当前会话、工具名、实际命令或文件路径、审批原因，以及 `/approve` / `/reject` 提示。命令里的 token、API key、password 等会被脱敏；同一聊天有多个审批时会排队，处理完当前审批后自动发下一个。
 
 ### 模型报 401 / MISSING_CREDENTIAL 怎么办？
 

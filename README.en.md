@@ -23,7 +23,7 @@ Connect **WeChat ClawBot (Tencent iLink)** to **DeepSeek Harness (DSH)**. Chat w
 - Conversation management: `/new`, `/list`, `/use`, `/title`
 - Model switching per conversation: `/model`
 - Workspace management: `/workspace`, `/workspace new`, `/workspace here`
-- Tool approvals forwarded to WeChat: `/approve`, `/reject`
+- Tool approvals forwarded to WeChat with tool name, command/path, and reason, with secret redaction; `/approve` grants one operation and `/reject` denies it, queued per chat
 - Inbound images/files through DSH attachments
 - Owner allowlist written automatically after QR login
 - Non-blocking inbound dispatch: agents run in the background while the WeChat long poll keeps receiving
@@ -177,6 +177,10 @@ No. Tencent's plugin currently declares direct chats only.
 ### Images, voice, and files?
 
 Images are downloaded, decrypted, and stored as DSH attachments (a vision model is required to see them). Files and videos are stored as attachments. Voice prefers Tencent's transcript; otherwise it is saved as a file.
+
+### What does a tool permission request look like in WeChat?
+
+It shows the conversation, tool name, the actual command or file path, and the approval reason, followed by `/approve` or `/reject`. Tokens, API keys, and passwords in the command are redacted. Multiple approvals for one chat are queued and sent one at a time.
 
 ### Model returns 401 or MISSING_CREDENTIAL?
 

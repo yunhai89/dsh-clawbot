@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 — 2026-11-16
+
+Tool approval adaptation.
+
+- Approval prompts now include the conversation, tool name, actual command/file path, and approval reason
+- Tool arguments are captured from `tool/call` events and cached by `callId`
+- Approval text redacts tokens, API keys, passwords, and Bearer credentials before sending
+- Multiple approvals in one WeChat chat are queued and delivered one at a time instead of failing the second request
+- Approval timeouts and aborts resolve as cancelled and advance the queue
+- Bare `1`/`2`/`y`/`n` are no longer accepted as approval decisions; use `/approve` or `/reject`
+
 ## 0.1.1 — 2026-11-16
 
 Security and performance hardening.

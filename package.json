@@ -1,6 +1,6 @@
 {
   "name": "dsh-clawbot",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "WeChat ClawBot (Tencent iLink) channel plugin for DeepSeek Harness (DSH): QR login, per-user sessions, model/workspace switching, and an OpenClaw host compatibility layer.",
   "keywords": [
     "dsh",

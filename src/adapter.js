@@ -41,6 +41,63 @@ function formatTurnReason(reason) {
   return reason.kind ? String(reason.kind) : JSON.stringify(reason);
 }
 
+function truncateText(value, max) {
+  const text = String(value ?? '');
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n…（已截断）`;
+}
+
+function redactForWeChat(value) {
+  return String(value ?? '')
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 ***')
+    .replace(/\b(?:sk|oc_sk|ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_-]{8,}/g, '***')
+    .replace(
+      /((?:api[_-]?key|access[_-]?token|token|secret|password|passwd|authorization)\s*[:=]\s*)(["']?)([^\s"',;]+)/gi,
+      '$1$2***',
+    );
+}
+
+function parseToolArguments(raw) {
+  if (raw && typeof raw === 'object') return raw;
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function formatToolAction(toolName, rawArguments) {
+  const parsed = parseToolArguments(rawArguments);
+  const name = String(toolName ?? 'unknown');
+  let action;
+  if (parsed && typeof parsed === 'object') {
+    if (name === 'bash' || name === 'pwsh') {
+      action = parsed.command;
+      if (parsed.description) action = `${action}\n说明：${parsed.description}`;
+    } else if (name === 'write') {
+      action = `写入文件：${parsed.path ?? '(unknown)'}`;
+      if (typeof parsed.content === 'string') action += `\n内容长度：${parsed.content.length} 字符`;
+    } else if (name === 'edit' || name === 'str_replace_editor') {
+      action = `编辑文件：${parsed.path ?? '(unknown)'}`;
+      if (typeof parsed.old_string === 'string') action += `\n替换：${parsed.old_string.length} → ${String(parsed.new_string ?? '').length} 字符`;
+    } else if (name === 'read' || name === 'read_image') {
+      action = `读取：${parsed.path ?? parsed.file_path ?? '(unknown)'}`;
+    } else if (name === 'apply_patch') {
+      action = `应用补丁：${parsed.path ?? parsed.patch?.slice?.(0, 120) ?? '(patch)'}`;
+    } else if (name === 'jobs') {
+      action = parsed.command ?? parsed.action ?? JSON.stringify(parsed);
+    } else if (name === 'present' || name === 'message' || name === 'wechat_send') {
+      action = parsed.path ?? parsed.text ?? JSON.stringify(parsed);
+    } else {
+      action = JSON.stringify(parsed, null, 2);
+    }
+  } else if (typeof rawArguments === 'string' && rawArguments.trim()) {
+    action = rawArguments.trim();
+  }
+  return redactForWeChat(truncateText(action || '(未捕获到参数)', 1400));
+}
+
 function toolNamesOf(messages) {
   const names = new Set();
   for (const message of messages) {
@@ -105,6 +162,8 @@ export class WeixinAdapter {
     this.agents = new Map();
     this.turns = new Map();
     this.pendingApprovals = new Map();
+    this.approvalQueues = new Map();
+    this.toolCalls = new Map();
     this.disposing = new Map();
     this.started = false;
     this.unlisten = null;
@@ -168,9 +227,7 @@ export class WeixinAdapter {
       clearInterval(this.idleTimer);
       this.idleTimer = null;
     }
-    for (const key of [...this.pendingApprovals.keys()]) {
-      this.resolveApproval(key, 'cancelled');
-    }
+    this.cancelAllApprovals();
     for (const sessionId of [...this.agents.keys()]) {
       await this.disposeAgent(sessionId).catch(() => {});
     }
@@ -183,6 +240,27 @@ export class WeixinAdapter {
   }
 
   onSessionEvent(session, event) {
+    const ours = this.agents.has(session.id);
+    if (ours && event.type === 'tool/call') {
+      const callId = String(event.data?.callId ?? '');
+      if (callId) {
+        this.toolCalls.set(callId, {
+          name: event.data?.name,
+          arguments: event.data?.arguments,
+          time: Date.now(),
+        });
+        if (this.toolCalls.size > 200) {
+          const oldest = [...this.toolCalls.entries()]
+            .sort((a, b) => a[1].time - b[1].time)
+            .slice(0, 50);
+          for (const [key] of oldest) this.toolCalls.delete(key);
+        }
+      }
+    } else if (ours && event.type === 'tool/result') {
+      const callId = String(event.data?.message?.toolCallId ?? event.data?.callId ?? '');
+      if (callId) this.toolCalls.delete(callId);
+    }
+
     const turn = this.turns.get(session.id);
     if (!turn) return;
     if (event.type === 'assistant/message') {
@@ -199,90 +277,187 @@ export class WeixinAdapter {
   }
 
   resolveApproval(key, outcome) {
-    const pending = this.pendingApprovals.get(key);
-    if (!pending) return false;
-    this.pendingApprovals.delete(key);
-    clearTimeout(pending.timer);
-    pending.resolve(outcome);
+    const current = this.pendingApprovals.get(key);
+    if (!current) return false;
+    this.finishApproval(current, outcome);
     return true;
+  }
+
+  finishApproval(entry, outcome, activateNext = true) {
+    if (!entry || entry.done) return;
+    entry.done = true;
+    if (entry.timer) clearTimeout(entry.timer);
+    try {
+      entry.abortCleanup?.();
+    } catch {
+      // best-effort
+    }
+    if (this.pendingApprovals.get(entry.key) === entry) {
+      this.pendingApprovals.delete(entry.key);
+    }
+    entry.resolve(outcome);
+    if (activateNext) this.activateNextApproval(entry.key);
+  }
+
+  activateNextApproval(key) {
+    const queue = this.approvalQueues.get(key);
+    if (!queue?.length) {
+      this.approvalQueues.delete(key);
+      return;
+    }
+    const next = queue.shift();
+    if (queue.length === 0) this.approvalQueues.delete(key);
+    this.activateApproval(next);
+  }
+
+  cancelAllApprovals() {
+    for (const current of [...this.pendingApprovals.values()]) {
+      this.finishApproval(current, 'cancelled', false);
+    }
+    for (const queue of [...this.approvalQueues.values()]) {
+      for (const entry of queue) this.finishApproval(entry, 'cancelled', false);
+    }
+    this.pendingApprovals.clear();
+    this.approvalQueues.clear();
+  }
+
+  async sendApprovalPrompt(entry) {
+    const action = formatToolAction(
+      entry.request.toolName ?? entry.cachedName,
+      entry.arguments,
+    );
+    const title = entry.conversation?.title || entry.sessionId;
+    const text = [
+      '【DSH 权限申请】',
+      `会话：${redactForWeChat(title)}`,
+      `工具：${redactForWeChat(entry.request.toolName ?? entry.cachedName ?? 'unknown')}`,
+      '动作：',
+      action,
+      entry.request.reason
+        ? `原因：${redactForWeChat(truncateText(entry.request.reason, 300))}`
+        : '',
+      '回复 /approve 允许一次，/reject 拒绝。',
+    ]
+      .filter(Boolean)
+      .join('\n');
+    await this.transport.send({
+      accountId: entry.record.accountId,
+      userId: entry.record.userId,
+      text,
+    });
+  }
+
+  activateApproval(entry) {
+    if (entry.done) return;
+    const { key, record, request } = entry;
+    this.pendingApprovals.set(key, entry);
+
+    const timeoutMs = Number(this.config.approvalTimeoutMs) > 0
+      ? Number(this.config.approvalTimeoutMs)
+      : 5 * 60_000;
+    entry.timer = setTimeout(() => {
+      this.finishApproval(entry, 'cancelled');
+      void this.transport
+        .send({
+          accountId: record.accountId,
+          userId: record.userId,
+          text: '⏱ 权限申请已超时，已按拒绝处理。',
+        })
+        .catch(() => {});
+    }, timeoutMs);
+    entry.timer.unref?.();
+
+    const onAbort = () => this.finishApproval(entry, 'cancelled');
+    request.signal?.addEventListener?.('abort', onAbort, { once: true });
+    entry.abortCleanup = () => request.signal?.removeEventListener?.('abort', onAbort);
+
+    void this.sendApprovalPrompt(entry).catch((error) => {
+      this.log(`approval prompt failed: ${errorMessage(error)}`);
+      this.finishApproval(entry, 'cancelled');
+    });
   }
 
   async onApprovalRequest(request, next) {
     const sessionId = String(request?.agent?.id ?? '');
     let record = this.agents.get(sessionId);
-    if (!record) {
-      const entry = this.conversations.findBySessionId(sessionId);
-      if (entry) {
+    let conversation;
+    if (record) {
+      conversation = record.conversation;
+    } else {
+      const found = this.conversations.findBySessionId(sessionId);
+      if (found) {
         record = {
-          accountId: entry.accountId,
-          userId: entry.userId,
+          accountId: found.accountId,
+          userId: found.userId,
           sessionId,
         };
+        conversation = found.conversation;
       }
     }
     if (!record?.accountId || !record?.userId) return next();
 
     const key = this.peerKey(record.accountId, record.userId);
-    if (this.pendingApprovals.has(key)) {
-      // Another approval is already waiting for this chat. Let the web UI's
-      // answerer (if any) decide instead of stacking two prompts.
-      return next();
+    let resolve;
+    const promise = new Promise((done) => {
+      resolve = done;
+    });
+    const cached = request.callId ? this.toolCalls.get(String(request.callId)) : undefined;
+    const entry = {
+      key,
+      request,
+      next,
+      record,
+      conversation,
+      sessionId,
+      resolve,
+      arguments: cached?.arguments,
+      cachedName: cached?.name,
+      done: false,
+      timer: null,
+      abortCleanup: null,
+    };
+
+    if (request.signal?.aborted) {
+      entry.done = true;
+      resolve('cancelled');
+      return promise;
     }
 
-    const timeoutMs = Number(this.config.approvalTimeoutMs) > 0
-      ? Number(this.config.approvalTimeoutMs)
-      : 5 * 60_000;
-
-    const promise = new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.pendingApprovals.delete(key);
-        resolve('cancelled');
+    if (this.pendingApprovals.has(key)) {
+      const queue = this.approvalQueues.get(key) ?? [];
+      const firstQueued = queue.length === 0;
+      queue.push(entry);
+      this.approvalQueues.set(key, queue);
+      if (firstQueued) {
         void this.transport
           .send({
             accountId: record.accountId,
             userId: record.userId,
-            text: '⏱ 审批已超时，已按拒绝处理。',
+            text: `当前审批处理完后，还有权限申请在排队（共 ${queue.length} 个）。`,
           })
           .catch(() => {});
-      }, timeoutMs);
-      timer.unref?.();
-      this.pendingApprovals.set(key, { resolve, timer });
-    });
-
-    try {
-      await this.transport.send({
-        accountId: record.accountId,
-        userId: record.userId,
-        text: [
-          '【DSH 审批】',
-          `工具：${request.toolName}`,
-          request.reason ? `原因：${request.reason}` : '',
-          '回复 /approve 同意，回复 /reject 拒绝。',
-        ]
-          .filter(Boolean)
-          .join('\n'),
-      });
-    } catch (error) {
-      this.resolveApproval(key, 'cancelled');
-      this.log(`approval prompt failed: ${errorMessage(error)}`);
+      }
+      return promise;
     }
 
+    this.activateApproval(entry);
     return promise;
   }
 
   handleApprovalReply(key, text) {
     const value = String(text ?? '').trim().toLowerCase();
-    const approve = new Set(['/approve', 'approve', '同意', 'yes', 'y', '1']);
-    const reject = new Set(['/reject', 'reject', '拒绝', 'no', 'n', '2']);
-    if (approve.has(value)) {
-      this.resolveApproval(key, 'allowed-once');
-      return { text: '已同意这一次操作。' };
+    const approve = new Set(['/approve', 'approve', '同意', 'yes']);
+    const reject = new Set(['/reject', 'reject', '拒绝', 'no']);
+    if (!approve.has(value) && !reject.has(value)) {
+      return { text: '当前有操作等待审批，请回复 /approve 允许一次，或 /reject 拒绝。' };
     }
-    if (reject.has(value)) {
-      this.resolveApproval(key, 'rejected');
-      return { text: '已拒绝这次操作。' };
-    }
-    return { text: '当前有操作等待审批，请回复 /approve 同意或 /reject 拒绝。' };
+    const queued = this.approvalQueues.get(key)?.length ?? 0;
+    this.resolveApproval(key, approve.has(value) ? 'allowed-once' : 'rejected');
+    return {
+      text: `${approve.has(value) ? '已允许这一次操作。' : '已拒绝这次操作。'}${
+        queued > 0 ? `\n还有 ${queued} 个权限申请排队。` : ''
+      }`,
+    };
   }
 
   beginTurn(sessionId) {
