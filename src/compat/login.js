@@ -8,6 +8,33 @@ const BOT_TYPE = '3';
 const QR_TIMEOUT_MS = 15_000;
 const QR_POLL_TIMEOUT_MS = 35_000;
 
+/**
+ * QR status polling receives a base URL from the browser after an iLink IDC
+ * redirect. Keep that value on Tencent's HTTPS origins so a local caller
+ * cannot turn this route into an SSRF probe.
+ */
+export function normalizeQrBaseUrl(raw, fallback) {
+  const value = String(raw ?? fallback ?? '').trim();
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('invalid QR polling base URL');
+  }
+  if (url.protocol !== 'https:') throw new Error('QR polling base URL must use https');
+  if (url.username || url.password) throw new Error('QR polling base URL must not contain credentials');
+  const host = url.hostname.toLowerCase();
+  if (
+    host !== 'weixin.qq.com' &&
+    !host.endsWith('.weixin.qq.com') &&
+    host !== 'qq.com' &&
+    !host.endsWith('.qq.com')
+  ) {
+    throw new Error(`QR polling host is not allowed: ${host}`);
+  }
+  return url.origin;
+}
+
 function localTokenList(api) {
   const ids = api.listIndexedWeixinAccountIds();
   const tokens = [];
@@ -40,13 +67,14 @@ export async function startQrLogin() {
 
 export async function pollQrLogin({ qrcode, baseUrl, verifyCode }) {
   const api = await loadPluginApi();
+  const safeBaseUrl = normalizeQrBaseUrl(baseUrl, api.DEFAULT_BASE_URL);
   let endpoint = `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`;
   if (verifyCode) endpoint += `&verify_code=${encodeURIComponent(verifyCode)}`;
 
   let raw;
   try {
     raw = await api.apiGetFetch({
-      baseUrl: baseUrl || api.DEFAULT_BASE_URL,
+      baseUrl: safeBaseUrl,
       endpoint,
       timeoutMs: QR_POLL_TIMEOUT_MS,
       label: 'pollQRStatus',

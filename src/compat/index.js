@@ -1,7 +1,8 @@
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { loadPluginApi } from './plugin-api.js';
-import { startQrLogin, pollQrLogin, writeBotAgentIdentity } from './login.js';
+import { startQrLogin, pollQrLogin, writeAllowFrom, writeBotAgentIdentity } from './login.js';
 import { createChannelRuntime } from './openclaw-runtime.js';
 import { ensureDir } from './util.js';
 import { errorMessage } from '../transport.js';
@@ -26,11 +27,55 @@ export class OpenClawCompat {
     this.accounts = new Map();
     this.lastError = null;
     this.initialized = false;
+    this.permissionTimer = null;
+  }
+
+  hardenStatePermissions() {
+    const skip = new Set(['media', 'sessions']);
+    const walk = (dir, depth = 0) => {
+      if (depth > 4) return;
+      try {
+        fs.chmodSync(dir, 0o700);
+      } catch {
+        // best-effort
+      }
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const target = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!skip.has(entry.name)) walk(target, depth + 1);
+        } else if (entry.isFile()) {
+          try {
+            fs.chmodSync(target, 0o600);
+          } catch {
+            // best-effort
+          }
+        }
+      }
+    };
+    try {
+      walk(this.stateDir);
+    } catch {
+      // never let permission hardening break the channel
+    }
+  }
+
+  ensurePermissionTimer() {
+    if (this.permissionTimer) return;
+    this.hardenStatePermissions();
+    this.permissionTimer = setInterval(() => this.hardenStatePermissions(), 5 * 60_000);
+    this.permissionTimer.unref?.();
   }
 
   async init() {
     if (this.initialized) return this;
     ensureDir(this.stateDir);
+    this.hardenStatePermissions();
 
     // The plugin reads these two environment variables at call time.
     process.env.OPENCLAW_STATE_DIR = this.stateDir;
@@ -71,6 +116,7 @@ export class OpenClawCompat {
   async start(handler) {
     await this.init();
     this.handler = handler;
+    this.ensurePermissionTimer();
     await this.stop({ notify: false });
 
     const ids = this.api.listIndexedWeixinAccountIds().filter(Boolean);
@@ -89,6 +135,27 @@ export class OpenClawCompat {
         continue;
       }
       if (!account.configured) continue;
+
+      // Fail closed. The upstream plugin treats an empty allowlist as "allow
+      // everyone"; never let a missing/legacy allowlist open the bot.
+      try {
+        const allow = this.api.readFrameworkAllowFromList?.(accountId) ?? [];
+        if (allow.length === 0 && this.config.allowAllUsers !== true) {
+          const owner = this.api.loadWeixinAccount(accountId)?.userId;
+          if (!owner) {
+            this.lastError = `account ${accountId} has no allowlist and no recorded owner`;
+            this.log(`ClawBot: refusing to start ${accountId}: no allowlist/owner`);
+            continue;
+          }
+          writeAllowFrom(this.api, accountId, owner);
+          this.log(`ClawBot: restored owner allowlist for ${accountId}`);
+        }
+      } catch (error) {
+        this.lastError = `allowlist check failed for ${accountId}: ${errorMessage(error)}`;
+        this.log(`ClawBot: ${this.lastError}`);
+        continue;
+      }
+
       this.startAccount(account);
     }
 
@@ -137,6 +204,10 @@ export class OpenClawCompat {
   }
 
   async stop({ notify = true } = {}) {
+    if (notify && this.permissionTimer) {
+      clearInterval(this.permissionTimer);
+      this.permissionTimer = null;
+    }
     const entries = [...this.accounts.values()];
     this.accounts.clear();
     for (const entry of entries) {
@@ -172,6 +243,7 @@ export class OpenClawCompat {
     await this.init();
     const result = await pollQrLogin(input);
     if (result.status === 'confirmed' || result.status === 'binded_redirect') {
+      this.hardenStatePermissions();
       await this.restart().catch((error) => {
         this.lastError = errorMessage(error);
         this.log(`ClawBot: restart after login failed: ${this.lastError}`);

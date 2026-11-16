@@ -272,6 +272,7 @@ DSH 的 sandbox / 写权限根目录绑定 Session 创建时的 `cwd`，所以 `
   config:
     stateDir: /root/.dsh/clawbot
     workspace: /root/.dsh/clawbot/workspace
+    workspaceRoots: []
     agentPreset: standard
     permissionPreset: workspace-write
     provider: deepseek-official
@@ -279,7 +280,9 @@ DSH 的 sandbox / 写权限根目录绑定 Session 创建时的 `cwd`，所以 `
     reasoningEffort: max
     maxTokens: 8192
     allowUsers: []
+    allowAllUsers: false
     approvalTimeoutMs: 300000
+    idleAgentTimeoutMs: 1800000
     replyProgress: true
     autoStart: true
     debug: false
@@ -290,13 +293,16 @@ DSH 的 sandbox / 写权限根目录绑定 Session 创建时的 `cwd`，所以 `
 |---|---|---|
 | `stateDir` | `$DSH_HOME/clawbot` | 账号 token、allowlist、媒体、会话映射的目录 |
 | `workspace` | `$DSH_HOME/clawbot/workspace` | 默认工作区 |
+| `workspaceRoots` | `[]` | 允许切换/创建的工作区根目录；空表示不限制。建议生产环境设为项目根目录 |
 | `agentPreset` | `standard` | DSH Agent preset |
 | `permissionPreset` | `workspace-write` | 权限预设；`ask` 的工具审批会转发到微信 |
 | `provider` / `model` | 当前默认模型 | 不填时使用 `agent-default-model` |
 | `reasoningEffort` | 模型默认 | 推理强度 |
 | `maxTokens` | 模型默认 | 单次输出上限 |
 | `allowUsers` | `[]` | 额外微信用户白名单；空表示使用扫码者 allowlist |
+| `allowAllUsers` | `false` | **危险**：允许 allowlist 为空时接收所有微信用户；默认 fail-closed |
 | `approvalTimeoutMs` | `300000` | 微信审批等待时间，超时按拒绝处理 |
+| `idleAgentTimeoutMs` | `1800000` | 空闲 Agent 回收时间；`0` 关闭。会话历史保留，下条消息自动 resume |
 | `replyProgress` | `true` | 是否允许腾讯插件的进度消息能力 |
 | `autoStart` | `true` | 插件加载时自动启动已登录账号 |
 | `debug` | `false` | 开启 `/api/dsh-clawbot/debug/inbound` 本地调试接口 |
@@ -378,12 +384,25 @@ curl -X POST http://127.0.0.1:3080/api/dsh-clawbot/debug/inbound \
 
 ## 安全模型
 
-- **扫码者白名单**：扫码成功后，扫码者的 `ilink_user_id` 自动写入 allowlist；其他微信用户默认拒绝。
+- **DSH Connection 鉴权**：`/api/dsh-clawbot/*` 精确路由不在普通 `/api` 桥里，因此额外调用 DSH Connection 的 `requestRejection()`；未登录的本地进程也无法扫码、登出或读状态。
+- **扫码者白名单（fail-closed）**：扫码成功后，扫码者的 `ilink_user_id` 自动写入 allowlist；账号没有 allowlist 且没有记录 owner 时，插件拒绝启动该账号，而不是退回“允许所有人”。
 - **审批转发**：默认 `workspace-write`，越界操作需要微信 `/approve`；超时按拒绝处理。
-- **工作区绑定**：DSH Session 的 sandbox / 写权限根目录绑定创建时的 `cwd`；切换工作区会开新会话。
+- **工作区绑定**：DSH Session 的 sandbox / 写权限根目录绑定创建时的 `cwd`；切换工作区会开新会话。可用 `workspaceRoots` 限制允许的工作区根目录。
+- **状态目录权限**：`$DSH_HOME/clawbot` 为 `700`；token、allowlist、context token、会话映射、SQLite 引用缓存均为 `600`，并每 5 分钟自动校正一次。
+- **SSRF 防护**：二维码轮询的 `baseUrl` 只允许腾讯 `https://*.weixin.qq.com` / `https://*.qq.com`，拒绝内网地址和带凭据 URL。
+- **登出确认**：`/logout` 必须显式提交 `{"confirm":true}`，Web UI 会二次确认。
 - **不要把 DSH Web 暴露到公网**：默认只监听 `127.0.0.1`；如需远程使用，走 SSH 隧道或加认证反向代理。
 - **不要把 `permissionPreset` 设为 `danger-full-access`**，除非你完全信任这个微信账号。
 - 微信消息走腾讯服务器，不是端到端加密；不要在聊天里发密码、token、私钥。
+
+## 性能设计
+
+- **非阻塞长轮询**：微信消息进入后台 dispatch，Agent 运行期间通道仍能收消息、处理审批和多用户请求。
+- **大文件流式写入**：超过 2 MB 的附件通过 `saveFileStream` 直接流进 DSH attachment，不在 Node 堆里整块缓存；图片单独限制 20 MB。
+- **模型目录缓存**：`/model` 的 provider/model 列表缓存 60 秒，并按 provider 并行查询，单个 provider 4 秒超时。
+- **会话写入合并**：`lastActiveAt` 这类高频变化 500 ms 合并一次落盘；结构性变更（新建/切换/改名/换模型）立即写。
+- **空闲 Agent 回收**：默认 30 分钟无活动就 dispose Agent，Session 历史保留，下条消息自动 resume。
+- **页面隐藏时暂停轮询**：Web 卡片在标签页隐藏时不再每 4 秒请求状态。
 
 ---
 

@@ -31,6 +31,7 @@ export class ConversationStore {
     this.filePath = filePath;
     this.legacyPath = legacyPath;
     this.log = log ?? (() => {});
+    this.saveTimer = null;
     this.data = this.load();
   }
 
@@ -75,7 +76,28 @@ export class ConversationStore {
   }
 
   save() {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
     this.saveData();
+  }
+
+  /**
+   * lastActiveAt changes on every inbound message. Coalesce those writes so a
+   * busy chat does not fsync the whole conversation map per message.
+   */
+  scheduleSave() {
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      this.saveData();
+    }, 500);
+    this.saveTimer.unref?.();
+  }
+
+  flush() {
+    this.save();
   }
 
   peerKey(accountId, userId) {
@@ -189,7 +211,7 @@ export class ConversationStore {
   touch(accountId, userId) {
     const conversation = this.current(accountId, userId);
     conversation.lastActiveAt = now();
-    this.save();
+    this.scheduleSave();
     return conversation;
   }
 

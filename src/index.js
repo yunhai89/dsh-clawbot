@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+
 import { WeixinAdapter } from './adapter.js';
 import { OpenClawCompat } from './compat/index.js';
 import { resolveStateDir, resolveWorkspace } from './paths.js';
@@ -12,6 +14,9 @@ function normalizeConfig(input = {}) {
     enabled: input.enabled !== false,
     stateDir: input.stateDir,
     workspace: input.workspace,
+    workspaceRoots: Array.isArray(input.workspaceRoots)
+      ? input.workspaceRoots.map((value) => String(value).trim()).filter(Boolean)
+      : [],
     agentPreset: input.agentPreset || 'standard',
     permissionPreset: input.permissionPreset || 'workspace-write',
     provider: input.provider,
@@ -21,9 +26,14 @@ function normalizeConfig(input = {}) {
     allowUsers: Array.isArray(input.allowUsers)
       ? input.allowUsers.map((value) => String(value).trim()).filter(Boolean)
       : [],
+    allowAllUsers: input.allowAllUsers === true,
     replyProgress: input.replyProgress !== false,
     autoStart: input.autoStart !== false,
     approvalTimeoutMs: input.approvalTimeoutMs,
+    idleAgentTimeoutMs:
+      Number.isFinite(Number(input.idleAgentTimeoutMs)) && Number(input.idleAgentTimeoutMs) >= 0
+        ? Number(input.idleAgentTimeoutMs)
+        : 30 * 60_000,
     debug: Boolean(input.debug),
     botAgent: input.botAgent || 'DSH-ClawBot/0.1',
   };
@@ -45,6 +55,14 @@ export async function apply(ctx, input = {}) {
   const stateDir = resolveStateDir(config);
   const workspace = resolveWorkspace(config, stateDir);
 
+  try {
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(stateDir, 0o700);
+  } catch {
+    // A read-only or shared state directory is a deployment choice; credential
+    // files themselves are still written with mode 0600.
+  }
+
   const compat = new OpenClawCompat({ ctx, config, stateDir, log });
   const adapter = new WeixinAdapter({ ctx, config, transport: compat, stateDir, workspace, log });
 
@@ -64,10 +82,15 @@ export async function apply(ctx, input = {}) {
   }
 
   // The Web card exists in every web profile; headless profiles simply skip it.
-  ctx.inject(['webServer'], (sctx) => {
+  ctx.inject(['webServer', 'connection'], (sctx) => {
     const webServer = sctx.get('webServer');
     sctx.effect(() => {
-      const routes = createRoutes({ compat, adapter, allowDebug: config.debug });
+      const routes = createRoutes({
+        compat,
+        adapter,
+        connection: sctx.get('connection'),
+        allowDebug: config.debug,
+      });
       const disposers = routes.map((route) => webServer.register(route));
       return () => {
         for (const dispose of disposers) {

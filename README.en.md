@@ -119,12 +119,15 @@ Override the `clawbot` row in `$DSH_HOME/profiles/<profile>/cordis.patch.yml`:
   name: dsh-clawbot
   config:
     workspace: /root/.dsh/clawbot/workspace
+    workspaceRoots: []
     agentPreset: standard
     permissionPreset: workspace-write
     provider: deepseek-official
     model: deepseek-flash
     allowUsers: []
+    allowAllUsers: false
     approvalTimeoutMs: 300000
+    idleAgentTimeoutMs: 1800000
     autoStart: true
     debug: false
 ```
@@ -135,11 +138,25 @@ State lives under `$DSH_HOME/clawbot` (tokens, allowlist, media, `conversations.
 
 ## Security
 
-- The QR owner is written to the allowlist; other WeChat users are rejected.
+- Exact `/api/dsh-clawbot/*` routes additionally call DSH Connection `requestRejection()`; an unauthenticated local process cannot start login, log out, or read status.
+- The QR owner is written to the allowlist. If an account has neither an allowlist nor a recorded owner, the monitor refuses to start (fail-closed).
 - Default `workspace-write`; cross-boundary tool calls require `/approve`.
+- State files are `600` under a `700` directory, and permissions are re-hardened every five minutes.
+- QR polling `baseUrl` is restricted to Tencent HTTPS origins; internal addresses and credentialed URLs are rejected.
+- `workspaceRoots` can confine workspace switching/creation to a deployment-owned directory tree.
+- `/logout` requires an explicit `{"confirm":true}` and the Web UI asks for confirmation.
 - Do not expose DSH Web publicly. Use an SSH tunnel or an authenticated reverse proxy.
 - WeChat messages go through Tencent servers; they are not end-to-end encrypted.
 - Do not use `danger-full-access` unless you fully trust the WeChat account.
+
+## Performance
+
+- Non-blocking inbound dispatch keeps the long poll receiving while an agent runs.
+- Files above 2 MB stream through `saveFileStream` instead of buffering in the Node heap.
+- Model catalog queries are cached for 60 seconds and run in parallel with per-provider timeouts.
+- `lastActiveAt` writes are coalesced for 500 ms; structural changes persist immediately.
+- Idle agents are reaped after 30 minutes by default; sessions remain resumable.
+- The Web card pauses status polling while the tab is hidden.
 
 ---
 

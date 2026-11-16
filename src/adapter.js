@@ -10,6 +10,7 @@ import { errorMessage } from './transport.js';
 const TURN_TIMEOUT_MS = 30 * 60_000;
 const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 const FILE_MAX_BYTES = 50 * 1024 * 1024;
+const STREAM_THRESHOLD_BYTES = 2 * 1024 * 1024;
 
 function textOf(message) {
   if (!message || !Array.isArray(message.content)) return '';
@@ -104,9 +105,11 @@ export class WeixinAdapter {
     this.agents = new Map();
     this.turns = new Map();
     this.pendingApprovals = new Map();
+    this.disposing = new Map();
     this.started = false;
     this.unlisten = null;
     this.unlistenApproval = null;
+    this.idleTimer = null;
     this.conversations = new ConversationStore({
       filePath: path.join(stateDir, 'conversations.json'),
       legacyPath: path.join(stateDir, 'session-map.json'),
@@ -114,6 +117,22 @@ export class WeixinAdapter {
     });
     this.modelCatalog = null;
     this.modelCatalogAt = 0;
+    this.workspaceRoots = (Array.isArray(config.workspaceRoots) ? config.workspaceRoots : [])
+      .map((root) => {
+        const value = String(root);
+        const expanded =
+          value === '~'
+            ? os.homedir()
+            : value.startsWith('~/')
+              ? path.join(os.homedir(), value.slice(2))
+              : path.resolve(value);
+        try {
+          return fs.realpathSync(expanded);
+        } catch {
+          return expanded;
+        }
+      })
+      .filter(Boolean);
   }
 
   async start() {
@@ -124,6 +143,11 @@ export class WeixinAdapter {
     this.unlistenApproval = this.ctx.on('approval/request', (request, next) =>
       this.onApprovalRequest(request, next),
     );
+    const idleTimeout = Number(this.config.idleAgentTimeoutMs) || 0;
+    if (idleTimeout > 0) {
+      this.idleTimer = setInterval(() => this.reapIdleAgents(idleTimeout), 60_000);
+      this.idleTimer.unref?.();
+    }
     this.started = true;
     await this.transport.start((message) => this.handleInbound(message));
     return this.status();
@@ -140,15 +164,21 @@ export class WeixinAdapter {
     }
     this.unlisten = null;
     this.unlistenApproval = null;
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
     for (const key of [...this.pendingApprovals.keys()]) {
       this.resolveApproval(key, 'cancelled');
     }
     for (const sessionId of [...this.agents.keys()]) {
       await this.disposeAgent(sessionId).catch(() => {});
     }
+    await Promise.allSettled([...this.disposing.values()]);
     for (const sessionId of [...this.turns.keys()]) {
       this.finishTurn(sessionId, 'stopped');
     }
+    this.conversations.flush();
     await this.transport.stop().catch(() => {});
   }
 
@@ -497,13 +527,36 @@ export class WeixinAdapter {
     return value;
   }
 
+  assertWorkspaceAllowed(real) {
+    if (this.workspaceRoots.length === 0) return real;
+    const allowed = this.workspaceRoots.some(
+      (root) => real === root || real.startsWith(`${root}${path.sep}`),
+    );
+    if (!allowed) {
+      throw new Error(`工作区不在允许的 workspaceRoots 内：${real}`);
+    }
+    return real;
+  }
+
+  assertWorkspacePathLexical(candidate) {
+    if (this.workspaceRoots.length === 0) return candidate;
+    const normalized = path.resolve(candidate);
+    const allowed = this.workspaceRoots.some(
+      (root) => normalized === root || normalized.startsWith(`${root}${path.sep}`),
+    );
+    if (!allowed) {
+      throw new Error(`工作区不在允许的 workspaceRoots 内：${normalized}`);
+    }
+    return normalized;
+  }
+
   async canonicalDirectory(raw, { create = false, base = this.workspace } = {}) {
-    const candidate = this.expandPath(raw, base);
+    const candidate = this.assertWorkspacePathLexical(this.expandPath(raw, base));
     if (create) await fs.promises.mkdir(candidate, { recursive: true });
     const real = await fs.promises.realpath(candidate);
     const stat = await fs.promises.stat(real);
     if (!stat.isDirectory()) throw new Error(`不是目录：${real}`);
-    return real;
+    return this.assertWorkspaceAllowed(real);
   }
 
   async ensureWorkspace(target) {
@@ -670,6 +723,7 @@ export class WeixinAdapter {
         accountId,
         userId,
         conversation,
+        lastUsedAt: Date.now(),
       };
       this.agents.set(sessionId, record);
       return record;
@@ -691,6 +745,7 @@ export class WeixinAdapter {
       accountId,
       userId,
       conversation,
+      lastUsedAt: Date.now(),
     };
     this.agents.set(sessionId, record);
     if (conversation?.model && handle.agent.model?.select) {
@@ -723,9 +778,14 @@ export class WeixinAdapter {
   async ensureAgent(message) {
     const conversation = this.currentConversation(message.accountId, message.userId);
     const sessionId = conversation.id;
+    const pendingDispose = this.disposing.get(sessionId);
+    if (pendingDispose) {
+      await pendingDispose.catch(() => {});
+    }
     const existing = this.agents.get(sessionId);
     if (existing) {
       existing.conversation = conversation;
+      existing.lastUsedAt = Date.now();
       return existing;
     }
 
@@ -738,6 +798,7 @@ export class WeixinAdapter {
         accountId: message.accountId,
         userId: message.userId,
         conversation,
+        lastUsedAt: Date.now(),
       };
       this.agents.set(sessionId, record);
       return record;
@@ -768,15 +829,39 @@ export class WeixinAdapter {
     }
   }
 
+  reapIdleAgents(idleTimeoutMs) {
+    const cutoff = Date.now() - idleTimeoutMs;
+    for (const [sessionId, record] of this.agents) {
+      if (this.turns.has(sessionId)) continue;
+      if (record.agent.status !== 'idle') continue;
+      const lastUsedAt = record.lastUsedAt ?? 0;
+      if (lastUsedAt > cutoff) continue;
+      this.log(`reaping idle agent ${sessionId}`);
+      void this.disposeAgent(sessionId).catch((error) => {
+        this.log(`idle agent dispose failed for ${sessionId}: ${errorMessage(error)}`);
+      });
+    }
+  }
+
   async disposeAgent(sessionId) {
+    const pending = this.disposing.get(sessionId);
+    if (pending) return pending;
     const record = this.agents.get(sessionId);
     if (!record) return;
     this.agents.delete(sessionId);
-    if (record.handle) {
-      await record.handle.dispose();
-    } else {
-      record.agent.cancel?.({ kind: 'user' });
-    }
+    const task = (async () => {
+      try {
+        if (record.handle) {
+          await record.handle.dispose();
+        } else {
+          record.agent.cancel?.({ kind: 'user' });
+        }
+      } finally {
+        this.disposing.delete(sessionId);
+      }
+    })();
+    this.disposing.set(sessionId, task);
+    return task;
   }
 
   async buildContent(message) {
@@ -788,41 +873,61 @@ export class WeixinAdapter {
 
     const attachments = this.ctx.get('attachments');
     for (const media of message.media ?? []) {
-      let buffer;
+      const label = media.name || path.basename(media.path);
+      let stat;
       try {
-        buffer = await fs.promises.readFile(media.path);
-      } catch (error) {
-        content.push({ type: 'text', text: `[附件读取失败: ${path.basename(media.path)}]` });
+        stat = await fs.promises.stat(media.path);
+      } catch {
+        content.push({ type: 'text', text: `[附件读取失败: ${label}]` });
+        continue;
+      }
+      if (!stat.isFile() || stat.size > FILE_MAX_BYTES) {
+        content.push({
+          type: 'text',
+          text: stat.isFile()
+            ? `[附件过大，未载入: ${label}, ${stat.size} bytes] ${media.path}`
+            : `[附件不是文件: ${label}]`,
+        });
         continue;
       }
 
-      const imageMime =
-        media.kind === 'image'
-          ? detectImageMime(buffer) ?? (String(media.mime ?? '').startsWith('image/') ? media.mime : undefined)
-          : undefined;
+      const mime = String(media.mime ?? '');
+      const isImage = media.kind === 'image' || mime.startsWith('image/');
 
-      if (imageMime && buffer.length <= IMAGE_MAX_BYTES && attachments) {
+      if (isImage && attachments && stat.size <= IMAGE_MAX_BYTES) {
         try {
-          const admitted = await attachments.admitPromptContent([
-            {
-              type: 'image',
-              mediaType: imageMime,
-              data: buffer.toString('base64'),
-              name: media.name,
-            },
-          ]);
-          content.push(...admitted);
-          continue;
+          const buffer = await fs.promises.readFile(media.path);
+          const imageMime = detectImageMime(buffer) ?? (mime.startsWith('image/') ? mime : undefined);
+          if (imageMime) {
+            const admitted = await attachments.admitPromptContent([
+              {
+                type: 'image',
+                mediaType: imageMime,
+                data: buffer.toString('base64'),
+                name: label,
+              },
+            ]);
+            content.push(...admitted);
+            continue;
+          }
         } catch (error) {
           this.log(`image admission failed: ${errorMessage(error)}`);
         }
       }
 
-      if (buffer.length <= FILE_MAX_BYTES && attachments) {
+      if (attachments) {
         try {
+          const name = safeFilename(label, 'attachment');
+          if (stat.size > STREAM_THRESHOLD_BYTES && typeof attachments.saveFileStream === 'function') {
+            const stream = fs.createReadStream(media.path);
+            const ref = await attachments.saveFileStream({ data: stream, name });
+            content.push({ type: 'file', attachment: ref });
+            continue;
+          }
+          const buffer = await fs.promises.readFile(media.path);
           const ref = await attachments.saveFile({
             data: buffer,
-            name: safeFilename(media.name || path.basename(media.path), 'attachment'),
+            name,
           });
           content.push({ type: 'file', attachment: ref });
           continue;
@@ -833,7 +938,7 @@ export class WeixinAdapter {
 
       content.push({
         type: 'text',
-        text: `[附件: ${media.name || path.basename(media.path)}] ${media.path}`,
+        text: `[附件: ${label}] ${media.path}`,
       });
     }
 
@@ -866,6 +971,7 @@ export class WeixinAdapter {
 
     const record = await this.ensureAgent(message);
     record.conversation = conversation;
+    record.lastUsedAt = Date.now();
     await record.agent.whenIdle();
 
     const turn = this.beginTurn(record.sessionId);
@@ -879,6 +985,7 @@ export class WeixinAdapter {
       });
       record.agent.followup(userMessage);
       const result = await turn.promise;
+      record.lastUsedAt = Date.now();
       const reply = lastAssistantText(result.assistant);
       if (reply) return { text: reply };
       const tools = toolNamesOf(result.assistant);

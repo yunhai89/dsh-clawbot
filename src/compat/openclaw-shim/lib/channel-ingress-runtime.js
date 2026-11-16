@@ -21,10 +21,9 @@ export async function resolveChannelMessageIngress(params) {
     allowFrom = [];
   }
 
-  // Legacy accounts without an allowlist keep OpenClaw's historical behaviour.
-  // The compat layer always writes the QR owner into the allowlist, so normal
-  // production traffic takes the explicit branch below.
-  const allowed = allowFrom.length === 0 || allowFrom.includes(senderId);
+  // Fail closed. The compat layer writes the QR owner into the allowlist
+  // before starting a monitor; an empty list means state is incomplete.
+  const allowed = allowFrom.includes(senderId);
   const commandRequested = Boolean(params?.command?.allowTextCommands);
 
   return {

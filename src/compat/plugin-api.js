@@ -45,6 +45,7 @@ export async function loadPluginApi() {
         unregisterWeixinAccountId: accounts.unregisterWeixinAccountId,
         resolveWeixinAccount: accounts.resolveWeixinAccount,
         resolveFrameworkAllowFromPath: pairing.resolveFrameworkAllowFromPath,
+        readFrameworkAllowFromList: pairing.readFrameworkAllowFromList,
         getContextToken: inbound.getContextToken,
         sendMessageWeixin: send.sendMessageWeixin,
         sendWeixinMediaFile: sendMedia.sendWeixinMediaFile,

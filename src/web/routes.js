@@ -10,6 +10,9 @@ function writeJson(res, status, body) {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'content-security-policy': "default-src 'none'",
   });
   res.end(payload);
 }
@@ -73,16 +76,31 @@ function isAllowed(req) {
   return typeof localAddress === 'string' && localAddress !== '0.0.0.0' && localAddress !== '::';
 }
 
-function guard(req, res, method = 'GET') {
-  if (!isAllowed(req)) {
-    writeJson(res, 403, { ok: false, error: 'local same-origin request required' });
-    return false;
-  }
-  if (req.method !== method) {
-    writeJson(res, 405, { ok: false, error: `method not allowed: ${req.method ?? ''}` });
-    return false;
-  }
-  return true;
+function createGuard(connection) {
+  return function guard(req, res, method = 'GET') {
+    // DSH's own Connection auth is the primary gate: it verifies the browser
+    // cookie / API credential and Host/Origin. Exact Web routes bypass the
+    // normal /api bridge, so without this check any local process could call
+    // login/logout. Fall back to the loopback guard only when Connection is
+    // not composed (for example a custom web serving shell).
+    const rejection = connection?.requestRejection?.(req);
+    if (rejection) {
+      writeJson(res, rejection, {
+        ok: false,
+        error: rejection === 401 ? 'authentication required' : 'request rejected',
+      });
+      return false;
+    }
+    if (!connection && !isAllowed(req)) {
+      writeJson(res, 403, { ok: false, error: 'local same-origin request required' });
+      return false;
+    }
+    if (req.method !== method) {
+      writeJson(res, 405, { ok: false, error: `method not allowed: ${req.method ?? ''}` });
+      return false;
+    }
+    return true;
+  };
 }
 
 function toStatus(compat, adapter) {
@@ -93,8 +111,11 @@ function toStatus(compat, adapter) {
   };
 }
 
-export function createRoutes({ compat, adapter, allowDebug = false }) {
+export function createRoutes({ compat, adapter, connection, allowDebug = false }) {
   const login = new Map();
+  const guard = createGuard(connection);
+  let activeLogin = null;
+  const QR_REUSE_MS = 60_000;
 
   const makeQr = async (result) => {
     const payload = result.qrUrl || result.qrcode;
@@ -126,7 +147,15 @@ export function createRoutes({ compat, adapter, allowDebug = false }) {
       handler: async (req, res) => {
         if (!guard(req, res, 'POST')) return;
         try {
+          if (activeLogin && Date.now() - activeLogin.startedAt < QR_REUSE_MS) {
+            writeJson(res, 200, { ok: true, ...(await makeQr(activeLogin.result)) });
+            return;
+          }
+          for (const [key, entry] of login) {
+            if (Date.now() - entry.createdAt > 10 * 60_000) login.delete(key);
+          }
           const result = await compat.loginStart();
+          activeLogin = { result, startedAt: Date.now() };
           login.set(result.qrcode, { createdAt: Date.now(), baseUrl: result.baseUrl });
           writeJson(res, 200, { ok: true, ...(await makeQr(result)) });
         } catch (error) {
@@ -141,19 +170,29 @@ export function createRoutes({ compat, adapter, allowDebug = false }) {
         if (!guard(req, res)) return;
         try {
           const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-          const qrcode = url.searchParams.get('qrcode');
-          if (!qrcode) {
-            writeJson(res, 400, { ok: false, error: 'qrcode is required' });
+          const qrcode = url.searchParams.get('qrcode') ?? '';
+          if (!/^[0-9a-f]{16,128}$/i.test(qrcode)) {
+            writeJson(res, 400, { ok: false, error: 'invalid qrcode' });
             return;
           }
           const known = login.get(qrcode);
+          if (!known) {
+            writeJson(res, 400, { ok: false, error: 'unknown or expired QR session' });
+            return;
+          }
           const redirectHost = url.searchParams.get('redirectHost') ?? undefined;
           const baseUrl =
             url.searchParams.get('baseUrl') ??
             (redirectHost ? `https://${redirectHost}` : known?.baseUrl);
           const result = await compat.loginPoll({ qrcode, baseUrl });
-          if (result.status === 'confirmed' || result.status === 'binded_redirect') {
+          if (
+            result.status === 'confirmed' ||
+            result.status === 'binded_redirect' ||
+            result.status === 'expired' ||
+            result.status === 'verify_code_blocked'
+          ) {
             login.delete(qrcode);
+            if (activeLogin?.result.qrcode === qrcode) activeLogin = null;
           }
           writeJson(res, 200, { ok: true, ...result });
         } catch (error) {
@@ -168,18 +207,28 @@ export function createRoutes({ compat, adapter, allowDebug = false }) {
         if (!guard(req, res, 'POST')) return;
         try {
           const body = await readJsonBody(req);
-          if (!body || typeof body.qrcode !== 'string') {
+          if (!body || typeof body.qrcode !== 'string' || !/^[0-9a-f]{16,128}$/i.test(body.qrcode)) {
             writeJson(res, 400, { ok: false, error: 'malformed JSON body' });
             return;
           }
           const known = login.get(body.qrcode);
+          if (!known) {
+            writeJson(res, 400, { ok: false, error: 'unknown or expired QR session' });
+            return;
+          }
           const result = await compat.loginPoll({
             qrcode: body.qrcode,
             baseUrl: body.baseUrl || known?.baseUrl,
             verifyCode: typeof body.verifyCode === 'string' ? body.verifyCode : undefined,
           });
-          if (result.status === 'confirmed' || result.status === 'binded_redirect') {
+          if (
+            result.status === 'confirmed' ||
+            result.status === 'binded_redirect' ||
+            result.status === 'expired' ||
+            result.status === 'verify_code_blocked'
+          ) {
             login.delete(body.qrcode);
+            if (activeLogin?.result.qrcode === body.qrcode) activeLogin = null;
           }
           writeJson(res, 200, { ok: true, ...result });
         } catch (error) {
@@ -221,8 +270,15 @@ export function createRoutes({ compat, adapter, allowDebug = false }) {
       handler: async (req, res) => {
         if (!guard(req, res, 'POST')) return;
         try {
+          const body = await readJsonBody(req);
+          if (!body || body.confirm !== true) {
+            writeJson(res, 400, { ok: false, error: 'logout requires {"confirm":true}' });
+            return;
+          }
           await adapter.stop();
           await compat.logout();
+          login.clear();
+          activeLogin = null;
           writeJson(res, 200, toStatus(compat, adapter));
         } catch (error) {
           writeJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });

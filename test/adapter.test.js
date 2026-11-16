@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 
 import { WeixinAdapter } from '../src/adapter.js';
@@ -254,6 +256,67 @@ test('A adapter creates and switches workspaces, and /new inherits the workspace
   assert.match(list.text, /新话题/);
 
   await adapter.stop();
+});
+
+test('workspaceRoots rejects paths outside the configured roots before mkdir', async () => {
+  const env = makeEnv();
+  const stateDir = `/tmp/opencode/clawbot-adapter-roots-${process.pid}`;
+  const outside = `/tmp/opencode/clawbot-outside-${process.pid}`;
+  fs.rmSync(outside, { recursive: true, force: true });
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: { agentPreset: 'standard', workspaceRoots: [stateDir] },
+    transport: env.transport,
+    stateDir,
+    workspace: stateDir,
+    log: () => {},
+  });
+  await adapter.start();
+  const reply = await adapter.handleInbound({
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    messageId: 'roots',
+    text: `/workspace new ${outside} outside`,
+  });
+  assert.match(reply.text, /workspaceRoots/);
+  assert.equal(fs.existsSync(outside), false);
+  await adapter.stop();
+});
+
+test('large inbound files stream into attachments instead of buffering', async () => {
+  const env = makeEnv();
+  const dir = `/tmp/opencode/clawbot-adapter-stream-${process.pid}`;
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, 'big.bin');
+  fs.writeFileSync(filePath, Buffer.alloc(3 * 1024 * 1024, 1));
+
+  let streamCalls = 0;
+  const attachments = {
+    saveFileStream: async ({ data, name }) => {
+      streamCalls += 1;
+      let bytes = 0;
+      for await (const chunk of data) bytes += chunk.length;
+      return { attachmentId: 'streamed', name, bytes };
+    },
+    saveFile: async ({ name }) => ({ attachmentId: 'buffered', name, bytes: 0 }),
+  };
+  const originalGet = env.ctx.get.bind(env.ctx);
+  env.ctx.get = (name) => (name === 'attachments' ? attachments : originalGet(name));
+
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: {},
+    transport: env.transport,
+    stateDir: dir,
+    workspace: dir,
+    log: () => {},
+  });
+  const content = await adapter.buildContent({
+    media: [{ kind: 'file', path: filePath, mime: 'application/octet-stream', name: 'big.bin' }],
+  });
+  assert.equal(streamCalls, 1);
+  assert.ok(content.some((part) => part.type === 'file' && part.attachment.attachmentId === 'streamed'));
 });
 
 test('A adapter handles /whoami without creating an agent', async () => {

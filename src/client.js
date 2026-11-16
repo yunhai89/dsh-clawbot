@@ -109,7 +109,9 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         void refresh();
-        const timer = setInterval(() => void refresh(), 4000);
+        const timer = setInterval(() => {
+          if (document.visibilityState !== 'hidden') void refresh();
+        }, 4000);
         return () => clearInterval(timer);
       }, [refresh]);
 
@@ -133,6 +135,7 @@ window.__ModuleLoader__.load({
         let cancelled = false;
         let baseUrl = qr.baseUrl;
         const tick = async () => {
+          if (document.visibilityState === 'hidden') return;
           try {
             const params = new URLSearchParams({ qrcode: qr.qrcode });
             if (baseUrl) params.set('baseUrl', baseUrl);
@@ -192,10 +195,14 @@ window.__ModuleLoader__.load({
       }, [qr, verifyCode, refresh]);
 
       const logout = useCallback(async () => {
+        if (!window.confirm('确定要退出微信 ClawBot 登录？这会删除本机保存的 bot token。')) return;
         setBusy(true);
         setError('');
         try {
-          await request('/logout', { method: 'POST' });
+          await request('/logout', {
+            method: 'POST',
+            body: JSON.stringify({ confirm: true }),
+          });
           setQr(null);
           setLogin(null);
           await refresh();
