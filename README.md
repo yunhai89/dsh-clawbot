@@ -386,7 +386,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-clawbot/debug/inbound \
 
 - **DSH Connection 鉴权**：`/api/dsh-clawbot/*` 精确路由不在普通 `/api` 桥里，因此额外调用 DSH Connection 的 `requestRejection()`；未登录的本地进程也无法扫码、登出或读状态。
 - **扫码者白名单（fail-closed）**：扫码成功后，扫码者的 `ilink_user_id` 自动写入 allowlist；账号没有 allowlist 且没有记录 owner 时，插件拒绝启动该账号，而不是退回“允许所有人”。
-- **审批转发**：默认 `workspace-write`，越界操作需要微信 `/approve`；审批卡片会带上工具名、实际命令/文件路径和原因，并对 token、API key、password 等做脱敏；同一聊天的多个审批会排队，超时按拒绝处理。
+- **审批转发**：默认 `workspace-write`，越界操作需要微信 `/approve`；审批卡片会带上工具名、实际命令/文件路径和原因，并对 token、API key、password 等做脱敏；同一聊天的多个审批会排队，子 Agent 的审批会按 `parentSession` 路由回发起它的微信会话，超时按拒绝处理。
 - **工作区绑定**：DSH Session 的 sandbox / 写权限根目录绑定创建时的 `cwd`；切换工作区会开新会话。可用 `workspaceRoots` 限制允许的工作区根目录。
 - **状态目录权限**：`$DSH_HOME/clawbot` 为 `700`；token、allowlist、context token、会话映射、SQLite 引用缓存均为 `600`，并每 5 分钟自动校正一次。
 - **SSRF 防护**：二维码轮询的 `baseUrl` 只允许腾讯 `https://*.weixin.qq.com` / `https://*.qq.com`，拒绝内网地址和带凭据 URL。

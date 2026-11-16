@@ -419,7 +419,6 @@ export class WeixinAdapter {
       ? Number(this.config.approvalTimeoutMs)
       : 5 * 60_000;
     entry.timer = setTimeout(() => {
-      this.finishApproval(entry, 'cancelled');
       void this.transport
         .send({
           accountId: record.accountId,
@@ -427,6 +426,7 @@ export class WeixinAdapter {
           text: '⏱ 权限申请已超时，已按拒绝处理。',
         })
         .catch(() => {});
+      this.finishApproval(entry, 'cancelled');
     }, timeoutMs);
     entry.timer.unref?.();
 

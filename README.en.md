@@ -140,7 +140,7 @@ State lives under `$DSH_HOME/clawbot` (tokens, allowlist, media, `conversations.
 
 - Exact `/api/dsh-clawbot/*` routes additionally call DSH Connection `requestRejection()`; an unauthenticated local process cannot start login, log out, or read status.
 - The QR owner is written to the allowlist. If an account has neither an allowlist nor a recorded owner, the monitor refuses to start (fail-closed).
-- Default `workspace-write`; cross-boundary tool calls require `/approve`.
+- Default `workspace-write`; cross-boundary tool calls require `/approve`. Approval prompts show the tool, command/path, and reason with secret redaction; multiple approvals queue per chat, and subagent approvals are routed back to the owning WeChat conversation through `parentSession`.
 - State files are `600` under a `700` directory, and permissions are re-hardened every five minutes.
 - QR polling `baseUrl` is restricted to Tencent HTTPS origins; internal addresses and credentialed URLs are rejected.
 - `workspaceRoots` can confine workspace switching/creation to a deployment-owned directory tree.
