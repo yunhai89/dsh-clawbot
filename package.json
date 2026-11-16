@@ -30,6 +30,9 @@
   },
   "type": "module",
   "main": "src/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "exports": {
     ".": "./src/index.js",
     "./client": "./src/client.js",
@@ -44,6 +47,7 @@
     "LICENSE"
   ],
   "license": "MIT",
+  "packageManager": "pnpm@12.18.0",
   "engines": {
     "node": ">=24.9.0"
   },
