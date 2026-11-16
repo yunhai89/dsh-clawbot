@@ -394,6 +394,7 @@ curl -X POST http://127.0.0.1:3080/api/dsh-clawbot/debug/inbound \
 - **不要把 DSH Web 暴露到公网**：默认只监听 `127.0.0.1`；如需远程使用，走 SSH 隧道或加认证反向代理。
 - **不要把 `permissionPreset` 设为 `danger-full-access`**，除非你完全信任这个微信账号。
 - 微信消息走腾讯服务器，不是端到端加密；不要在聊天里发密码、token、私钥。
+- 安全问题请走 [SECURITY.md](./SECURITY.md) 的私密报告渠道，不要公开提交可导致 token 泄露或命令执行的 issue。
 
 ## 性能设计
 
