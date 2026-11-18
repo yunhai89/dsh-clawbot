@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { ConversationStore } from './conversations.js';
-import { detectImageMime, ensureDir, safeFilename } from './util.js';
+import { detectImageMime, ensureDir, isVoiceFilePath, safeFilename } from './util.js';
 import { errorMessage } from './transport.js';
 
 const TURN_TIMEOUT_MS = 30 * 60_000;
@@ -29,16 +29,186 @@ function lastAssistantText(messages) {
   return '';
 }
 
+const FAILURE_HINTS = {
+  ACCOUNT_QUOTA: '账户额度不足',
+  ACCOUNT_SIGN_IN_REQUIRED: '需要重新登录模型账号',
+  ACCOUNT_TOKEN_INVALID: '模型账号令牌无效',
+  AUTH: '模型鉴权失败',
+  CONTEXT_WINDOW_EXCEEDED: '上下文超出模型窗口',
+  EMPTY_RESPONSE: '模型返回空响应',
+  INVALID_CREDENTIAL: '模型凭证无效',
+  INVALID_REQUEST: '模型请求无效',
+  MISSING_CREDENTIAL: '缺少模型凭证',
+  MODEL_UNSUPPORTED: '当前模型不支持该请求',
+  QUOTA: '账户额度或余额不足',
+  RATE_LIMIT: '模型请求被限流',
+  SERVER: '模型服务端错误',
+  TIMEOUT: '模型请求超时',
+  TRANSPORT: '模型网络传输失败',
+};
+
+const GOAL_PHASE_LABELS = {
+  active: '进行中',
+  paused: '已暂停',
+  blocked: '已阻塞',
+  complete: '已完成',
+};
+
+const GOAL_ERROR_HINTS = {
+  GOAL_AGENT_NOT_LIVE: '目标会话尚未恢复，请重试',
+  GOAL_ALREADY_EXISTS: '当前已有未完成目标',
+  GOAL_INVALID_BLOCK_REASON: '阻塞原因不能为空',
+  GOAL_INVALID_EDIT: '没有提供要修改的内容',
+  GOAL_INVALID_MAX_ROUNDS: '轮数必须是正整数',
+  GOAL_INVALID_OBJECTIVE: '目标内容不能为空',
+  GOAL_INVALID_TRANSITION: '当前目标状态不支持该操作',
+  GOAL_NOT_FOUND: '当前没有目标',
+  GOAL_STALE_REVISION: '目标状态已变化，请重新发送 /goal',
+};
+
+function reasonKind(reason) {
+  if (!reason) return undefined;
+  if (typeof reason === 'string') return reason;
+  return reason.kind;
+}
+
 function formatTurnReason(reason) {
-  if (!reason || typeof reason !== 'object') return String(reason ?? 'unknown');
-  if (reason.kind === 'error') {
-    const message = reason.error?.message ?? reason.error ?? 'unknown error';
-    const code = reason.error?.code ? ` (${reason.error.code})` : '';
-    return `模型调用失败：${message}${code}`;
+  const kind = reasonKind(reason);
+  if (kind === 'error') {
+    const failure = typeof reason === 'object' ? reason.error : undefined;
+    const message =
+      typeof failure === 'string'
+        ? failure
+        : failure?.message ?? 'unknown error';
+    const code = typeof failure === 'object' && failure?.code ? String(failure.code) : '';
+    const hint = code ? FAILURE_HINTS[code] : undefined;
+    const details = [];
+    if (code) details.push(code);
+    if (typeof failure === 'object' && failure?.status) details.push(`HTTP ${failure.status}`);
+    if (typeof failure === 'object' && failure?.requestId) details.push(`请求 ${failure.requestId}`);
+    return redactForWeChat(
+      truncateText(
+        `模型调用失败${hint ? `（${hint}）` : ''}：${message}${
+          details.length > 0 ? ` [${details.join(' | ')}]` : ''
+        }`,
+        1500,
+      ),
+    );
   }
-  if (reason.kind === 'cancelled') return '本轮已取消';
-  if (reason.kind === 'completed') return 'completed';
-  return reason.kind ? String(reason.kind) : JSON.stringify(reason);
+
+  switch (kind) {
+    case 'completed':
+      return '已完成';
+    case 'cancelled':
+      return '本轮已取消';
+    case 'aborted': {
+      const cause = typeof reason === 'object' ? reason.reason : undefined;
+      const label =
+        cause?.kind === 'user'
+          ? '用户停止'
+          : cause?.kind === 'disposed'
+            ? '会话已释放'
+            : cause?.kind === 'parent'
+              ? '父会话中止'
+              : cause?.kind === 'hook'
+                ? redactForWeChat(cause.reason)
+                : undefined;
+      return label ? `本轮已中止（${label}）` : '本轮已中止';
+    }
+    case 'blocked':
+      return '本轮被前置检查拦截';
+    case 'max-tokens':
+      return '本轮达到输出 token 上限';
+    case 'timeout':
+      return '本轮执行超时';
+    case 'interrupted':
+      return '本轮因进程中断而中止';
+    case 'forked':
+      return '本轮在会话分叉时结束';
+    case 'switched':
+      return '会话已切换';
+    case 'replaced':
+      return '本轮已被新的消息替换';
+    case 'stopped':
+    case 'stopping':
+      return 'ClawBot 通道已停止';
+    default:
+      return kind ? String(kind) : '未知原因';
+  }
+}
+
+function formatTurnReport(messages, reason) {
+  const reply = lastAssistantText(messages);
+  const tools = toolNamesOf(messages);
+  const kind = reasonKind(reason);
+
+  if (kind === 'error') {
+    const parts = [`本轮执行失败：${formatTurnReason(reason)}`];
+    if (reply) parts.push(`失败前的回复：\n${reply}`);
+    if (tools.length > 0) parts.push(`失败前调用过：${tools.join(', ')}`);
+    return parts.join('\n\n');
+  }
+
+  if (kind && kind !== 'completed') {
+    const detail = formatTurnReason(reason);
+    if (reply) return `${reply}\n\n（${detail}）`;
+    if (tools.length > 0) return `已执行：${tools.join(', ')}\n（${detail}）`;
+    return `（${detail}）`;
+  }
+
+  if (reply) return reply;
+  if (tools.length > 0) return `已执行：${tools.join(', ')}`;
+  return '（本轮没有文字回复）';
+}
+
+function formatGoalStatus(goal) {
+  if (!goal) {
+    return [
+      '当前没有目标。',
+      '',
+      '发送 /goal <目标> 创建目标，DSH 会围绕该目标自动继续执行。',
+    ].join('\n');
+  }
+
+  const lines = [
+    `目标：${goal.objective}`,
+    `状态：${GOAL_PHASE_LABELS[goal.phase] ?? goal.phase}`,
+    `轮次：${goal.roundsStarted}/${goal.maxGoalRounds}`,
+    `自动继续：${goal.activation === 'armed' ? '已开启' : '已暂停'}`,
+  ];
+  if (goal.phase === 'blocked' && goal.blockedReason) {
+    lines.push(
+      `阻塞原因：${goal.blockedReason.message}${
+        goal.blockedReason.code ? ` (${goal.blockedReason.code})` : ''
+      }`,
+    );
+  }
+  lines.push('', `操作：${formatGoalHint(goal)}`);
+  return lines.join('\n');
+}
+
+function formatGoalHint(goal) {
+  if (!goal) return '/goal <目标> — 创建目标';
+  if (goal.phase === 'complete') {
+    return '/goal <目标> — 创建新目标 · /goal clear — 清除记录';
+  }
+  const hints = [
+    '/goal edit <目标> — 修改目标',
+    goal.phase === 'active' && goal.activation === 'armed'
+      ? '/goal pause — 暂停自动继续'
+      : '/goal resume — 恢复执行',
+    '/goal complete — 标记完成',
+    '/goal clear — 清除目标',
+  ];
+  return hints.join(' · ');
+}
+
+function formatGoalError(error) {
+  const code = error?.code ? String(error.code) : '';
+  const hint = code ? GOAL_ERROR_HINTS[code] : undefined;
+  return `目标操作失败${hint ? `（${hint}）` : ''}：${redactForWeChat(errorMessage(error))}${
+    code ? ` (${code})` : ''
+  }`;
 }
 
 function truncateText(value, max) {
@@ -132,6 +302,19 @@ function parseCommand(text) {
   return { name, args };
 }
 
+function splitPathArgument(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) return { path: '', rest: '' };
+  const quote = value[0];
+  if ((quote === '"' || quote === "'") && value.indexOf(quote, 1) > 0) {
+    const end = value.indexOf(quote, 1);
+    return { path: value.slice(1, end).trim(), rest: value.slice(end + 1).trim() };
+  }
+  const space = value.indexOf(' ');
+  if (space === -1) return { path: value, rest: '' };
+  return { path: value.slice(0, space), rest: value.slice(space + 1).trim() };
+}
+
 async function createUserMessage(content, source) {
   try {
     const mod = await import('@deepseek-ai/dsh-llm');
@@ -161,6 +344,7 @@ export class WeixinAdapter {
     this.log = log ?? (() => {});
     this.agents = new Map();
     this.turns = new Map();
+    this.goalTurns = new Map();
     this.pendingApprovals = new Map();
     this.approvalQueues = new Map();
     this.toolCalls = new Map();
@@ -234,6 +418,10 @@ export class WeixinAdapter {
     await Promise.allSettled([...this.disposing.values()]);
     for (const sessionId of [...this.turns.keys()]) {
       this.finishTurn(sessionId, 'stopped');
+    }
+    for (const [sessionId, entry] of [...this.goalTurns]) {
+      clearTimeout(entry.timer);
+      this.goalTurns.delete(sessionId);
     }
     this.conversations.flush();
     await this.transport.stop().catch(() => {});
@@ -322,13 +510,109 @@ export class WeixinAdapter {
     }
 
     const turn = this.turns.get(session.id);
-    if (!turn) return;
     if (event.type === 'assistant/message') {
-      turn.assistant.push(event.data.message);
+      if (turn) {
+        turn.assistant.push(event.data.message);
+      } else {
+        this.goalTurns.get(session.id)?.assistant.push(event.data.message);
+      }
       return;
     }
     if (event.type === 'turn/end') {
-      this.finishTurn(session.id, event.data.reason);
+      if (turn) {
+        this.finishTurn(session.id, event.data.reason);
+      } else {
+        this.finishGoalTurn(session.id, event.data.reason);
+      }
+      return;
+    }
+    if (event.type === 'deliverables/presented') {
+      const holder = turn ?? this.goalTurns.get(session.id);
+      if (holder && Array.isArray(event.data?.files)) {
+        holder.deliverables.push(...event.data.files);
+      }
+      return;
+    }
+    if (event.type === 'user/message' && !turn && this.config.goalProgress !== false) {
+      const record = this.agents.get(session.id);
+      if (record && event.data?.source?.kind === 'goal') {
+        this.beginGoalTurn(record, event.data.source);
+      }
+    }
+  }
+
+  beginGoalTurn(record, source) {
+    const sessionId = record.sessionId;
+    if (this.turns.has(sessionId)) return;
+    const existing = this.goalTurns.get(sessionId);
+    if (existing) clearTimeout(existing.timer);
+    const entry = {
+      accountId: record.accountId,
+      userId: record.userId,
+      round: Number(source?.round) || 0,
+      assistant: [],
+      deliverables: [],
+      timer: setTimeout(() => this.finishGoalTurn(sessionId, 'timeout'), TURN_TIMEOUT_MS),
+    };
+    entry.timer.unref?.();
+    this.goalTurns.set(sessionId, entry);
+  }
+
+  finishGoalTurn(sessionId, reason) {
+    const entry = this.goalTurns.get(sessionId);
+    if (!entry) return;
+    this.goalTurns.delete(sessionId);
+    clearTimeout(entry.timer);
+    void this.deliverGoalTurn(sessionId, entry, reason).catch((error) => {
+      this.log(`goal turn delivery failed: ${errorMessage(error)}`);
+    });
+  }
+
+  async deliverGoalTurn(sessionId, entry, reason) {
+    const record = this.agents.get(sessionId);
+    const prefix = entry.round > 0 ? `【目标 · 第 ${entry.round} 轮】` : '【目标】';
+    const parts = [`${prefix}\n${formatTurnReport(entry.assistant, reason)}`];
+
+    try {
+      const goals = this.ctx.get('goals');
+      const goal = record ? goals?.get?.(record.agent) : undefined;
+      if (goal) {
+        if (goal.phase === 'complete') {
+          parts.push(`目标已完成：${goal.objective}`);
+        } else if (goal.phase === 'blocked') {
+          parts.push(
+            `目标已阻塞：${goal.blockedReason?.message ?? goal.objective}\n发送 /goal resume 可继续。`,
+          );
+        } else if (goal.phase === 'paused') {
+          parts.push('目标已暂停，发送 /goal resume 恢复。');
+        } else if (
+          goal.activation === 'disarmed'
+          || reasonKind(reason) === 'error'
+          || reasonKind(reason) === 'max-tokens'
+          || reasonKind(reason) === 'timeout'
+        ) {
+          parts.push('目标自动继续已暂停，发送 /goal resume 恢复。');
+        }
+      }
+    } catch (error) {
+      this.log(`goal status lookup failed: ${errorMessage(error)}`);
+    }
+
+    await this.transport.send({
+      accountId: entry.accountId,
+      userId: entry.userId,
+      text: parts.join('\n\n'),
+    });
+
+    if (record) {
+      const delivery = await this.sendDeliverables(record, entry.deliverables);
+      if (delivery.failed.length > 0) {
+        await this.transport.send({
+          accountId: entry.accountId,
+          userId: entry.userId,
+          text: `以下目标文件未发送：\n${delivery.failed.join('\n')}`,
+        });
+      }
     }
   }
 
@@ -518,6 +802,7 @@ export class WeixinAdapter {
     });
     const turn = {
       assistant: [],
+      deliverables: [],
       resolve,
       timer: setTimeout(() => this.finishTurn(sessionId, 'timeout'), TURN_TIMEOUT_MS),
     };
@@ -531,7 +816,7 @@ export class WeixinAdapter {
     if (!turn) return;
     this.turns.delete(sessionId);
     clearTimeout(turn.timer);
-    turn.resolve({ assistant: turn.assistant, reason });
+    turn.resolve({ assistant: turn.assistant, deliverables: turn.deliverables, reason });
   }
 
   currentConversation(accountId, userId) {
@@ -910,6 +1195,23 @@ export class WeixinAdapter {
     try {
       const setup = async (agentCtx) => {
         if (presets && preset) await presets.mount(agentCtx, preset.id);
+        try {
+          agentCtx.inject(['systemPrompt'], (scope) => {
+            scope.systemPrompt.section({
+              name: 'clawbot:media',
+              order: scope.systemPrompt.getSectionOrder('FILE_REFERENCE'),
+              text:
+                'This DSH session is bridged to WeChat. When the user asks for an image, '
+                + 'file, video, or voice message, create or locate the file and call present '
+                + 'with absolute path(s); files presented at the end of the turn are sent to '
+                + 'the WeChat chat automatically. Audio files are attempted as native voice '
+                + 'messages when possible; unsupported codecs are sent as files. '
+                + 'Files must be inside the session workspace.',
+            });
+          });
+        } catch (error) {
+          this.log(`system prompt media guidance failed: ${errorMessage(error)}`);
+        }
       };
       const handle = await this.ctx.agents.create({
         sessionId,
@@ -1171,6 +1473,69 @@ export class WeixinAdapter {
     return content;
   }
 
+  async resolveOutboundFile(accountId, userId, rawPath) {
+    const value = String(rawPath ?? '').trim();
+    if (!value) throw new Error('文件路径为空');
+    const conversation = this.currentConversation(accountId, userId);
+    const workspace = this.currentWorkspace(conversation);
+    const root = await fs.promises.realpath(workspace);
+    const candidate = await fs.promises.realpath(path.resolve(workspace, value));
+    const relative = path.relative(root, candidate);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new Error('只能发送工作区内的文件');
+    }
+    const stat = await fs.promises.stat(candidate);
+    if (!stat.isFile()) throw new Error('不是普通文件');
+    if (stat.size > FILE_MAX_BYTES) {
+      throw new Error(`文件过大（${stat.size} bytes，上限 ${FILE_MAX_BYTES}）`);
+    }
+    return candidate;
+  }
+
+  async sendDeliverables(record, files) {
+    const sent = [];
+    const failed = [];
+    const seen = new Set();
+    for (const file of Array.isArray(files) ? files : []) {
+      const rawPath = typeof file === 'string' ? file : file?.path;
+      if (!rawPath) continue;
+      let target;
+      try {
+        target = await this.resolveOutboundFile(record.accountId, record.userId, rawPath);
+      } catch (error) {
+        failed.push(`${rawPath}（${errorMessage(error)}）`);
+        continue;
+      }
+      if (seen.has(target)) continue;
+      seen.add(target);
+      const caption =
+        typeof file === 'object' && file?.description
+          ? redactForWeChat(file.description)
+          : undefined;
+      try {
+        if (isVoiceFilePath(target)) {
+          await this.transport.send({
+            accountId: record.accountId,
+            userId: record.userId,
+            voicePath: target,
+            ...(caption ? { text: caption } : {}),
+          });
+        } else {
+          await this.transport.send({
+            accountId: record.accountId,
+            userId: record.userId,
+            mediaPath: target,
+            ...(caption ? { text: caption } : {}),
+          });
+        }
+        sent.push(target);
+      } catch (error) {
+        failed.push(`${target}（${errorMessage(error)}）`);
+      }
+    }
+    return { sent, failed };
+  }
+
   async handleInbound(message) {
     if (this.config.allowUsers?.length && !this.config.allowUsers.includes(message.userId)) {
       return { text: '未授权：这个微信用户不在 clawbot.allowUsers 白名单中。' };
@@ -1211,11 +1576,15 @@ export class WeixinAdapter {
       record.agent.followup(userMessage);
       const result = await turn.promise;
       record.lastUsedAt = Date.now();
-      const reply = lastAssistantText(result.assistant);
-      if (reply) return { text: reply };
-      const tools = toolNamesOf(result.assistant);
-      if (tools.length > 0) return { text: `已执行：${tools.join(', ')}` };
-      return { text: `（本轮没有文字回复：${formatTurnReason(result.reason)}）` };
+      const delivery = await this.sendDeliverables(record, result.deliverables);
+      let text = formatTurnReport(result.assistant, result.reason);
+      if (delivery.sent.length > 0 && text === '（本轮没有文字回复）') {
+        text = `已发送 ${delivery.sent.length} 个文件。`;
+      }
+      if (delivery.failed.length > 0) {
+        text += `${text ? '\n\n' : ''}以下文件未发送：\n${delivery.failed.join('\n')}`;
+      }
+      return { text };
     } catch (error) {
       this.finishTurn(record.sessionId, 'error');
       throw error;
@@ -1226,6 +1595,10 @@ export class WeixinAdapter {
     const accountId = message.accountId;
     const userId = message.userId;
     switch (command.name) {
+      case '/goal':
+      case '/target':
+      case '/目标':
+        return this.handleGoalCommand(message, command);
       case '/new': {
         const oldConversation = this.currentConversation(accountId, userId);
         const old = this.agents.get(oldConversation.id);
@@ -1371,20 +1744,40 @@ export class WeixinAdapter {
         };
       }
       case '/send': {
-        if (!command.args) return { text: '用法：/send <工作区内文件路径>' };
+        if (!command.args) return { text: '用法：/send <工作区内文件路径> [说明]' };
         try {
-          const conversation = this.currentConversation(accountId, userId);
-          const workspace = this.currentWorkspace(conversation);
-          const root = await fs.promises.realpath(workspace);
-          const candidate = await fs.promises.realpath(path.resolve(workspace, command.args));
-          const relative = path.relative(root, candidate);
-          if (relative.startsWith('..') || path.isAbsolute(relative)) {
-            return { text: '只能发送工作区内的文件。' };
-          }
-          await this.transport.send({ accountId, userId, mediaPath: candidate });
+          const { path: rawPath, rest } = splitPathArgument(command.args);
+          const target = await this.resolveOutboundFile(accountId, userId, rawPath);
+          await this.transport.send({
+            accountId,
+            userId,
+            mediaPath: target,
+            ...(rest ? { text: rest } : {}),
+          });
           return null;
         } catch (error) {
           return { text: `发送失败: ${errorMessage(error)}` };
+        }
+      }
+      case '/voice': {
+        if (!command.args) return { text: '用法：/voice <工作区内音频路径> [说明]' };
+        try {
+          const { path: rawPath, rest } = splitPathArgument(command.args);
+          const target = await this.resolveOutboundFile(accountId, userId, rawPath);
+          if (!isVoiceFilePath(target)) {
+            return {
+              text: '无法作为语音发送：请使用音频文件（.silk/.wav 可直接转换，其他格式需要 ffmpeg）。',
+            };
+          }
+          await this.transport.send({
+            accountId,
+            userId,
+            voicePath: target,
+            ...(rest ? { text: rest } : {}),
+          });
+          return null;
+        } catch (error) {
+          return { text: `语音发送失败: ${errorMessage(error)}` };
         }
       }
       case '/help':
@@ -1400,15 +1793,149 @@ export class WeixinAdapter {
             '/workspace — 列出/切换工作区',
             '/workspace <序号|标题|路径> — 切换到该工作区（新会话）',
             '/workspace new <路径> [标题] — 创建并登记工作区',
+            '/goal — 查看当前目标',
+            '/goal <目标> — 创建目标并自动继续执行',
+            '/goal edit <目标> — 修改目标',
+            '/goal pause|resume|complete|clear — 控制目标',
+            '/goal rounds <轮数> — 修改自动继续轮数上限',
             '/status — 查看当前状态',
             '/stop — 停止当前任务',
             '/whoami — 查看账号/会话',
-            '/send <路径> — 发送工作区内文件',
+            '/send <路径> [说明] — 发送工作区内图片/文件/视频',
+            '/voice <路径> [说明] — 发送工作区内音频为微信语音',
             '/help — 显示帮助',
           ].join('\n'),
         };
       default:
         return { text: `未知命令：${command.name}\n发送 /help 查看可用命令。` };
+    }
+  }
+
+  async handleGoalCommand(message, command) {
+    const accountId = message.accountId;
+    const userId = message.userId;
+    const goals = this.ctx.get('goals');
+    if (!goals || typeof goals.get !== 'function' || typeof goals.create !== 'function') {
+      return {
+        text: '当前 DSH 未启用目标服务（goals），无法使用 /goal。请确认 standard preset 已加载 dsh-goal。',
+      };
+    }
+
+    let record;
+    try {
+      this.conversations.touch(accountId, userId);
+      record = await this.ensureAgent(message);
+      record.lastUsedAt = Date.now();
+    } catch (error) {
+      return { text: `目标操作失败：无法准备当前会话：${errorMessage(error)}` };
+    }
+
+    let current;
+    try {
+      current = goals.get(record.agent);
+    } catch (error) {
+      return { text: formatGoalError(error) };
+    }
+
+    const raw = command.args.trim();
+    const lower = raw.toLowerCase();
+    const ref = current ? { id: current.id, revision: current.revision } : undefined;
+    const created = (goal, title) => ({
+      text: `${title}\n\n${formatGoalStatus(goal)}`,
+    });
+
+    try {
+      if (!raw || lower === 'status' || lower === 'show') {
+        return { text: formatGoalStatus(current) };
+      }
+
+      if (lower === 'clear') {
+        if (!current) return { text: '当前没有目标。' };
+        goals.clear(record.agent, ref);
+        return { text: '目标已清除。' };
+      }
+
+      if (lower === 'pause') {
+        if (!current) return { text: '当前没有目标，无法暂停。' };
+        if (current.phase !== 'active') {
+          return { text: `当前目标状态为「${GOAL_PHASE_LABELS[current.phase] ?? current.phase}」，无法暂停。` };
+        }
+        return created(goals.pause(record.agent, ref), '目标已暂停。');
+      }
+
+      if (lower === 'resume') {
+        if (!current) return { text: '当前没有目标，无法恢复。' };
+        if (current.phase === 'complete') return { text: '目标已经完成。发送 /goal <新目标> 创建新目标。' };
+        if (current.phase === 'active' && current.activation === 'armed') {
+          return { text: '目标正在执行中，无需恢复。' };
+        }
+        return created(goals.resume(record.agent, ref), '目标已恢复，DSH 会自动继续执行。');
+      }
+
+      if (lower === 'complete' || lower === 'done') {
+        if (!current) return { text: '当前没有目标，无法标记完成。' };
+        if (current.phase === 'complete') return { text: '目标已经完成。' };
+        return created(goals.complete(record.agent, ref), '目标已标记完成。');
+      }
+
+      const blockMatch = raw.match(/^block(?:\s+([\s\S]+))?$/i);
+      if (blockMatch) {
+        if (!current) return { text: '当前没有目标，无法标记阻塞。' };
+        if (current.phase !== 'active') {
+          return { text: `当前目标状态为「${GOAL_PHASE_LABELS[current.phase] ?? current.phase}」，无法标记阻塞。` };
+        }
+        const reason = blockMatch[1]?.trim();
+        if (!reason) return { text: '用法：/goal block <阻塞原因>' };
+        return created(
+          goals.block(record.agent, ref, { code: 'user-reported', message: reason }),
+          '目标已标记阻塞。',
+        );
+      }
+
+      const roundsMatch = raw.match(/^(?:rounds?|max)\s+(\d+)$/i);
+      if (roundsMatch) {
+        if (!current) return { text: '当前没有目标，无法设置轮数上限。' };
+        const rounds = Number(roundsMatch[1]);
+        if (!Number.isSafeInteger(rounds) || rounds < 1) {
+          return { text: '轮数上限必须是正整数。' };
+        }
+        if (rounds < current.roundsStarted) {
+          return { text: `轮数上限不能小于已执行轮数（${current.roundsStarted}）。` };
+        }
+        return created(
+          goals.edit(record.agent, ref, { maxGoalRounds: rounds }),
+          `轮数上限已改为 ${rounds}。`,
+        );
+      }
+
+      const editMatch = raw.match(/^edit(?:\s+([\s\S]+))?$/i);
+      if (editMatch) {
+        const objective = editMatch[1]?.trim();
+        if (!objective) return { text: '用法：/goal edit <新目标>' };
+        if (!current) {
+          return { text: '当前没有目标。直接发送 /goal <目标> 创建。' };
+        }
+        const updated =
+          current.phase === 'complete'
+            ? goals.create(record.agent, { objective })
+            : goals.edit(record.agent, ref, { objective });
+        return created(updated, current.phase === 'complete' ? '目标已创建。' : '目标已更新。');
+      }
+
+      const createMatch = raw.match(/^(?:new|create)\s+([\s\S]+)$/i);
+      const objective = (createMatch ? createMatch[1] : raw).trim();
+      if (!objective) return { text: '用法：/goal <目标>' };
+      if (current && current.phase !== 'complete') {
+        return {
+          text: [
+            `当前已有${GOAL_PHASE_LABELS[current.phase] ?? current.phase}目标：${current.objective}`,
+            '请先用 /goal edit <目标> 修改，或 /goal clear 清除后再创建。',
+          ].join('\n'),
+        };
+      }
+      return created(goals.create(record.agent, { objective }), '目标已创建，DSH 会自动继续执行。');
+    } catch (error) {
+      return { text: formatGoalError(error) };
     }
   }
 

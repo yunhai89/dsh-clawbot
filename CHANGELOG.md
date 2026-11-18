@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.4 — 2026-11-19
+
+Goal mode and truthful failure reporting.
+
+- Add `/goal <objective>` (aliases `/target`, `/目标`) to create a DSH goal directly from WeChat without the model-only `create_goal` authority check
+- Add `/goal` status plus `edit`, `pause`, `resume`, `complete`, `block`, `rounds`, and `clear`
+- Push each automatic goal round back to WeChat as `【目标 · 第 N 轮】`; add `goalProgress` to disable round messages
+- Report the real `turn/end` failure (message, code, HTTP status, request id, reason kind) instead of falling back to `已执行：<tool list>`
+- Keep the executed tool list as secondary context after an error
+- Deliver files declared with DSH's `present` tool to WeChat after the turn
+- Add native outbound voice via `VOICE` items using the plugin's CDN primitives: pass through `.silk`, encode `.wav` with `silk-wasm`, transcode other formats with `ffmpeg` when available, and fall back to a file when conversion or sending fails
+- Add `/voice <path> [caption]`; extend `/send` with captions, quoted paths, and shared workspace confinement
+- Add per-agent prompt guidance so models use `present` for WeChat media
+- Add `silk-wasm` dependency for WAV-to-SILK encoding
+- Cover goal commands, goal-round delivery, mid-turn quota errors, outbound media, and voice in tests
+
 ## 0.1.3 — 2026-11-16
 
 - Route subagent approval requests to the owning WeChat conversation by walking `parentSession`

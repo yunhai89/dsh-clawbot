@@ -21,6 +21,7 @@ Do not open a public issue for a vulnerability that could expose WeChat bot toke
 - Bot tokens, allowlists, context tokens, conversation state, and quote-cache SQLite files are stored with mode `600` under a `700` state directory. Permissions are re-hardened periodically.
 - QR polling base URLs are restricted to Tencent HTTPS origins to prevent SSRF.
 - `workspaceRoots` can confine workspace creation and switching to deployment-owned directories.
+- Outbound media from `/send`, `/voice`, and `present` is resolved with `realpath` and confined to the current workspace, so the model cannot exfiltrate files outside it.
 - Tool approvals are forwarded to WeChat and time out fail-closed.
 - `/logout` requires an explicit confirmation.
 

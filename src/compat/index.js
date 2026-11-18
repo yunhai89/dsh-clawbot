@@ -252,7 +252,7 @@ export class OpenClawCompat {
     return result;
   }
 
-  async send({ accountId, userId, text, mediaPath }) {
+  async send({ accountId, userId, text, mediaPath, voicePath }) {
     await this.init();
     const account = this.api.resolveWeixinAccount(this.cfg, accountId);
     if (!account.configured) {
@@ -265,6 +265,33 @@ export class OpenClawCompat {
       contextToken,
       accountId: account.accountId,
     };
+
+    if (voicePath) {
+      if (text) {
+        await this.api.sendMessageWeixin({ to: userId, text, opts });
+      }
+      try {
+        const result = await this.api.sendWeixinVoiceFile({
+          filePath: voicePath,
+          to: userId,
+          opts,
+          cdnBaseUrl: account.cdnBaseUrl,
+        });
+        return { messageId: String(result?.messageId ?? '') };
+      } catch (error) {
+        // The upstream plugin has no voice sender; if this custom VOICE item
+        // is rejected by a server/version, at least deliver the audio as a file.
+        this.log(`ClawBot: voice send failed, falling back to file: ${errorMessage(error)}`);
+        const result = await this.api.sendWeixinMediaFile({
+          filePath: voicePath,
+          to: userId,
+          text: '',
+          opts,
+          cdnBaseUrl: account.cdnBaseUrl,
+        });
+        return { messageId: String(result?.messageId ?? '') };
+      }
+    }
 
     if (mediaPath) {
       const result = await this.api.sendWeixinMediaFile({

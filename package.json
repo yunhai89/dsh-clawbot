@@ -1,6 +1,6 @@
 {
   "name": "dsh-clawbot",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "WeChat ClawBot (Tencent iLink) channel plugin for DeepSeek Harness (DSH): QR login, per-user sessions, model/workspace switching, and an OpenClaw host compatibility layer.",
   "keywords": [
     "dsh",
@@ -55,7 +55,8 @@
   "dependencies": {
     "@tencent-weixin/openclaw-weixin": "2.4.10",
     "openclaw": "file:src/compat/openclaw-shim",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "silk-wasm": "^3.7.1"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.1.0",

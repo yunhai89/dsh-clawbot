@@ -64,6 +64,29 @@ export function detectImageMime(buffer) {
   return undefined;
 }
 
+const VOICE_AUDIO_EXTENSIONS = new Set([
+  '.adpcm',
+  '.aac',
+  '.aif',
+  '.aiff',
+  '.amr',
+  '.flac',
+  '.m4a',
+  '.mp3',
+  '.ogg',
+  '.opus',
+  '.pcm',
+  '.silk',
+  '.slk',
+  '.speex',
+  '.wav',
+]);
+
+/** Whether a path looks like audio that can be attempted as a WeChat voice item. */
+export function isVoiceFilePath(filePath) {
+  return VOICE_AUDIO_EXTENSIONS.has(path.extname(String(filePath ?? '')).toLowerCase());
+}
+
 export function mimeFromPath(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   const map = {

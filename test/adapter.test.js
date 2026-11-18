@@ -5,9 +5,12 @@ import test from 'node:test';
 
 import { WeixinAdapter } from '../src/adapter.js';
 
-function makeEnv(replyText = '你好，我是 DSH。') {
+function makeEnv(replyText = '你好，我是 DSH。', options = {}) {
   let sessionListener;
   const workspaces = [];
+  const assistantContent =
+    options.assistantContent ?? [{ type: 'text', text: replyText }];
+  const reason = options.reason ?? 'completed';
   const makeAgent = (sessionId) => ({
     id: sessionId,
     status: 'idle',
@@ -15,18 +18,21 @@ function makeEnv(replyText = '你好，我是 DSH。') {
     whenIdle: async () => {},
     followup: () => {
       queueMicrotask(() => {
+        for (const event of options.events ?? []) {
+          sessionListener({ id: sessionId }, event);
+        }
         sessionListener({ id: sessionId }, {
           type: 'assistant/message',
           data: {
             message: {
               role: 'assistant',
-              content: [{ type: 'text', text: replyText }],
+              content: assistantContent,
             },
           },
         });
         sessionListener({ id: sessionId }, {
           type: 'turn/end',
-          data: { reason: 'completed' },
+          data: { reason },
         });
       });
     },
@@ -280,6 +286,275 @@ test('workspaceRoots rejects paths outside the configured roots before mkdir', a
   });
   assert.match(reply.text, /workspaceRoots/);
   assert.equal(fs.existsSync(outside), false);
+  await adapter.stop();
+});
+
+function installGoalService(env) {
+  let goal;
+  let nextId = 0;
+  const clone = () => (goal ? { ...goal } : undefined);
+  const service = {
+    get: () => clone(),
+    create: (_agent, { objective, maxGoalRounds = 10 }) => {
+      nextId += 1;
+      goal = {
+        id: `goal-${nextId}`,
+        revision: 1,
+        objective,
+        phase: 'active',
+        roundsStarted: 0,
+        maxGoalRounds,
+        activation: 'armed',
+      };
+      return clone();
+    },
+    edit: (_agent, ref, request) => {
+      assert.equal(ref.revision, goal.revision);
+      goal = {
+        ...goal,
+        revision: goal.revision + 1,
+        ...(request.objective === undefined ? {} : { objective: request.objective }),
+        ...(request.maxGoalRounds === undefined ? {} : { maxGoalRounds: request.maxGoalRounds }),
+      };
+      return clone();
+    },
+    pause: () => {
+      goal = { ...goal, revision: goal.revision + 1, phase: 'paused', activation: 'disarmed' };
+      return clone();
+    },
+    resume: () => {
+      goal = { ...goal, revision: goal.revision + 1, phase: 'active', activation: 'armed' };
+      return clone();
+    },
+    complete: () => {
+      goal = { ...goal, revision: goal.revision + 1, phase: 'complete', activation: 'disarmed' };
+      return clone();
+    },
+    block: (_agent, _ref, reason) => {
+      goal = {
+        ...goal,
+        revision: goal.revision + 1,
+        phase: 'blocked',
+        activation: 'disarmed',
+        blockedReason: reason,
+      };
+      return clone();
+    },
+    clear: () => {
+      const cleared = { id: goal.id, revision: goal.revision + 1 };
+      goal = undefined;
+      return cleared;
+    },
+  };
+  const originalGet = env.ctx.get.bind(env.ctx);
+  env.ctx.get = (name) => (name === 'goals' ? service : originalGet(name));
+  return { service, state: () => goal };
+}
+
+test('A adapter creates and controls goals with the /goal command', async () => {
+  const env = makeEnv();
+  const { state } = installGoalService(env);
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: { agentPreset: 'standard' },
+    transport: env.transport,
+    stateDir: `/tmp/opencode/clawbot-adapter-goal-${process.pid}`,
+    workspace: `/tmp/opencode/clawbot-adapter-goal-${process.pid}/workspace`,
+    log: () => {},
+  });
+  await adapter.start();
+
+  const base = { accountId: 'acct', userId: 'u1@im.wechat' };
+  const run = (text) => adapter.handleInbound({ ...base, messageId: text, text });
+
+  const absent = await run('/goal');
+  assert.match(absent.text, /当前没有目标/);
+
+  const created = await run('/goal 修复所有失败的测试');
+  assert.match(created.text, /目标已创建/);
+  assert.match(created.text, /修复所有失败的测试/);
+  assert.equal(state().phase, 'active');
+
+  const shown = await run('/goal');
+  assert.match(shown.text, /修复所有失败的测试/);
+  assert.match(shown.text, /进行中/);
+
+  const edited = await run('/goal edit 修复所有测试并提交');
+  assert.match(edited.text, /修复所有测试并提交/);
+
+  const rounds = await run('/goal rounds 12');
+  assert.match(rounds.text, /12/);
+  assert.equal(state().maxGoalRounds, 12);
+
+  const paused = await run('/goal pause');
+  assert.match(paused.text, /已暂停/);
+
+  const resumed = await run('/goal resume');
+  assert.match(resumed.text, /已恢复/);
+  assert.equal(state().activation, 'armed');
+
+  const completed = await run('/goal complete');
+  assert.match(completed.text, /已完成/);
+
+  const replacement = await run('/goal 新目标');
+  assert.match(replacement.text, /目标已创建/);
+  assert.match(state().objective, /新目标/);
+
+  const cleared = await run('/goal clear');
+  assert.match(cleared.text, /已清除/);
+  assert.equal(state(), undefined);
+
+  await adapter.stop();
+});
+
+test('goal rounds are delivered back to WeChat', async () => {
+  const sent = [];
+  const env = makeEnv();
+  env.transport.send = async (message) => {
+    sent.push(message);
+    return { messageId: 'goal-round' };
+  };
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: { agentPreset: 'standard', goalProgress: true },
+    transport: env.transport,
+    stateDir: `/tmp/opencode/clawbot-adapter-goal-round-${process.pid}`,
+    workspace: `/tmp/opencode/clawbot-adapter-goal-round-${process.pid}/workspace`,
+    log: () => {},
+  });
+  await adapter.start();
+
+  await adapter.handleInbound({
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    messageId: 'goal-setup',
+    text: '你好',
+  });
+  const sessionId = [...adapter.agents.keys()][0];
+  assert.ok(sessionId);
+
+  adapter.onSessionEvent(
+    { id: sessionId },
+    {
+      type: 'user/message',
+      data: { source: { kind: 'goal', goalId: 'g1', revision: 1, round: 3 } },
+    },
+  );
+  adapter.onSessionEvent(
+    { id: sessionId },
+    {
+      type: 'assistant/message',
+      data: {
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: '第 3 轮已完成一部分。' }],
+        },
+      },
+    },
+  );
+  adapter.onSessionEvent(
+    { id: sessionId },
+    { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /目标 · 第 3 轮/);
+  assert.match(sent[0].text, /第 3 轮已完成一部分/);
+  await adapter.stop();
+});
+
+test('mid-turn model errors are reported instead of a bare tool list', async () => {
+  const env = makeEnv('', {
+    assistantContent: [
+      { type: 'tool-call', name: 'create_goal', callId: 'c1', arguments: '{"objective":"x"}' },
+      { type: 'tool-call', name: 'bash', callId: 'c2', arguments: '{"command":"ls"}' },
+    ],
+    reason: {
+      kind: 'error',
+      error: { message: 'Insufficient Balance', code: 'QUOTA', status: 402 },
+    },
+  });
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: { agentPreset: 'standard' },
+    transport: env.transport,
+    stateDir: `/tmp/opencode/clawbot-adapter-error-${process.pid}`,
+    workspace: `/tmp/opencode/clawbot-adapter-error-${process.pid}/workspace`,
+    log: () => {},
+  });
+  await adapter.start();
+
+  const reply = await adapter.handleInbound({
+    accountId: 'acct',
+    userId: 'u1@im.wechat',
+    messageId: 'error-turn',
+    text: '帮我完成目标',
+  });
+
+  assert.match(reply.text, /^本轮执行失败/);
+  assert.match(reply.text, /余额不足/);
+  assert.match(reply.text, /Insufficient Balance/);
+  assert.match(reply.text, /QUOTA/);
+  assert.match(reply.text, /HTTP 402/);
+  assert.match(reply.text, /失败前调用过：create_goal, bash/);
+
+  await adapter.stop();
+});
+
+test('A adapter sends workspace media, voice files, and present deliverables', async () => {
+  const sent = [];
+  const env = makeEnv('报告已生成。', {
+    events: [
+      {
+        type: 'deliverables/presented',
+        data: { files: [{ path: 'report.pdf', description: '测试报告' }] },
+      },
+    ],
+  });
+  env.transport.send = async (message) => {
+    sent.push(message);
+    return { messageId: `media-${sent.length}` };
+  };
+  const stateDir = `/tmp/opencode/clawbot-adapter-media-${process.pid}`;
+  const workspace = path.join(stateDir, 'workspace');
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.writeFileSync(path.join(workspace, 'report.pdf'), '%PDF-1.4 test');
+  fs.writeFileSync(path.join(workspace, 'image.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  fs.writeFileSync(path.join(workspace, 'voice.mp3'), Buffer.from('ID3test'));
+
+  const adapter = new WeixinAdapter({
+    ctx: env.ctx,
+    config: { agentPreset: 'standard' },
+    transport: env.transport,
+    stateDir,
+    workspace,
+    log: () => {},
+  });
+  await adapter.start();
+
+  const base = { accountId: 'acct', userId: 'u1@im.wechat' };
+  const run = (text) => adapter.handleInbound({ ...base, messageId: text, text });
+
+  const reply = await run('生成报告');
+  assert.deepEqual(reply, { text: '报告已生成。' });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].mediaPath, fs.realpathSync(path.join(workspace, 'report.pdf')));
+  assert.equal(sent[0].text, '测试报告');
+
+  const image = await run('/send image.png 截图');
+  assert.equal(image, null);
+  assert.equal(sent.at(-1).mediaPath, fs.realpathSync(path.join(workspace, 'image.png')));
+  assert.equal(sent.at(-1).text, '截图');
+
+  const voice = await run('/voice voice.mp3 听一下');
+  assert.equal(voice, null);
+  assert.equal(sent.at(-1).voicePath, fs.realpathSync(path.join(workspace, 'voice.mp3')));
+  assert.equal(sent.at(-1).text, '听一下');
+
+  const outside = await run('/send /etc/passwd');
+  assert.match(outside.text, /只能发送工作区内的文件/);
+
   await adapter.stop();
 });
 

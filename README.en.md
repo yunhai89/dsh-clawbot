@@ -22,9 +22,12 @@ Connect **WeChat ClawBot (Tencent iLink)** to **DeepSeek Harness (DSH)**. Chat w
 - Text chat: final assistant reply is sent back to WeChat
 - Conversation management: `/new`, `/list`, `/use`, `/title`
 - Model switching per conversation: `/model`
+- Goal mode: `/goal <objective>` creates a DSH goal directly and reports each continuation round back to WeChat
 - Workspace management: `/workspace`, `/workspace new`, `/workspace here`
 - Tool approvals forwarded to WeChat with tool name, command/path, and reason, with secret redaction; `/approve` grants one operation and `/reject` denies it, queued per chat
 - Inbound images/files through DSH attachments
+- Outbound images/files/videos: `/send` for workspace files, plus automatic delivery of files declared with `present`
+- Outbound voice: `/voice` converts `.silk`/`.wav` audio (and other formats when `ffmpeg` is available) into native WeChat VOICE items, falling back to a file when conversion or sending fails
 - Owner allowlist written automatically after QR login
 - Non-blocking inbound dispatch: agents run in the background while the WeChat long poll keeps receiving
 
@@ -99,14 +102,47 @@ After scanning, send `/whoami` in WeChat. It does not call a model and verifies 
 | `/workspace here` | Show the current workspace |
 | `/model` | List current/available models |
 | `/model <index\|provider/model\|default>` | Switch model |
+| `/goal` | Show the current goal and continuation state |
+| `/goal <objective>` | Create a goal directly; aliases `/target`, `/目标` |
+| `/goal edit <objective>` | Edit the current goal |
+| `/goal pause` / `/goal resume` | Pause or resume automatic continuation |
+| `/goal complete` | Mark the goal complete |
+| `/goal block <reason>` | Mark the goal blocked |
+| `/goal rounds <n>` | Change the continuation round cap |
+| `/goal clear` | Clear the current goal |
 | `/status` | Show account, conversation, model, agent status |
 | `/stop` | Stop the current task |
 | `/whoami` | Show account/user/conversation id |
-| `/send <path>` | Send a file from the current workspace |
+| `/send <path> [caption]` | Send a workspace image/file/video (quoted paths supported) |
+| `/voice <path> [caption]` | Convert workspace audio into a native WeChat voice message, falling back to a file |
 | `/approve` / `/reject` | Approve or reject a tool request |
 | `/help` | Show help |
 
 `/workspace` switching opens a new conversation because DSH binds its sandbox/write roots to the Session `cwd` at creation. Old conversations are preserved.
+
+### Goal mode
+
+Ordinary WeChat messages enter DSH as `source.kind = clawbot`, so the model cannot create a goal with the `create_goal` tool: that tool only accepts a direct human message in a top-level turn. `/goal` bypasses the model and calls the goal service directly:
+
+```text
+/goal Fix all failing tests and commit
+```
+
+DSH's goal-round driver then continues automatically. Each round, error, and terminal state is pushed back to WeChat as `【目标 · 第 N 轮】`. If a quota or other error stops continuation, the message tells you to send `/goal resume`.
+
+### Outbound images, files, videos, and voice
+
+```text
+/send report.pdf Final report
+/send "output/screenshot.png"
+/voice voice.mp3 Listen to this
+```
+
+- `/send` routes images, videos, and other files through Tencent's media sender. Paths must stay inside the current workspace.
+- `/voice` builds a native WeChat VOICE item: `.silk` passes through, `.wav` is encoded to 16 kHz SILK with the bundled `silk-wasm`, and `.mp3`/`.ogg`/`.m4a`/etc. require `ffmpeg` on PATH. Conversion or send failures fall back to a file attachment.
+- Files declared with DSH's `present` tool are sent to WeChat after the turn. Workspace audio uses the voice path; other files use the image/video/file path.
+- There is no TTS: voice messages require an existing audio file.
+- iLink may silently drop native bot voice bubbles on some accounts even when the send API succeeds. Use `/send` when a reliable audio file is required.
 
 ---
 
@@ -128,11 +164,13 @@ Override the `clawbot` row in `$DSH_HOME/profiles/<profile>/cordis.patch.yml`:
     allowAllUsers: false
     approvalTimeoutMs: 300000
     idleAgentTimeoutMs: 1800000
+    replyProgress: true
+    goalProgress: true
     autoStart: true
     debug: false
 ```
 
-State lives under `$DSH_HOME/clawbot` (tokens, allowlist, media, `conversations.json`).
+`goalProgress` controls whether automatic goal-round results are pushed to WeChat (default `true`). State lives under `$DSH_HOME/clawbot` (tokens, allowlist, media, `conversations.json`).
 
 ---
 
@@ -185,6 +223,18 @@ It shows the conversation, tool name, the actual command or file path, and the a
 ### Model returns 401 or MISSING_CREDENTIAL?
 
 Fix the provider credentials in DSH Models, or set a working `provider`/`model` for the `clawbot` row. This is not a WeChat channel issue.
+
+### Why does asking DSH in chat to create a goal fail?
+
+DSH's `create_goal` tool requires a direct human message (`source.kind = user`) in the current top-level turn. WeChat messages are injected with `source.kind = clawbot`, so the tool rejects the model. Use `/goal <objective>` instead; it calls the goal service directly.
+
+### Why did a failed turn only show "已执行：..."?
+
+Older versions checked assistant text and otherwise fell back to a tool-name list, hiding the real failure. The adapter now reports the concrete error, code, and HTTP status, followed by any tools that ran before the failure.
+
+### Can WeChat send images, files, videos, and voice messages?
+
+Yes. Use `/send` for images/files/videos and `/voice` for voice. Files declared by the model through `present` are also delivered automatically after the turn. Voice requires an existing audio file; text-to-speech is not included. `.silk` and `.wav` work directly, while other formats need `ffmpeg` for conversion. All outbound paths are confined to the current workspace so the model cannot exfiltrate files from elsewhere.
 
 ---
 

@@ -57,9 +57,12 @@
 - **文本消息收发**：DSH 最终 assistant 回复自动发回微信
 - **会话管理**：`/new`、`/list`、`/use`、`/title`
 - **模型切换**：`/model` 查看和切换当前会话模型
+- **目标模式**：`/goal <目标>` 通过指令直接创建 DSH 目标并自动继续执行，不依赖模型调用 `create_goal`；每轮结果自动推回微信
 - **工作区管理**：`/workspace` 列出、切换、创建 DSH 工作区
 - **微信内审批**：工具需要权限时推送到微信，显示工具、命令/文件路径和原因，自动脱敏 token；回复 `/approve` 允许一次或 `/reject` 拒绝，多个审批按聊天排队
 - **图片/文件入站**：图片走 DSH attachment（需要视觉模型），其他文件走附件路径
+- **图片/文件/视频出站**：`/send` 发送工作区内文件；模型调用 `present` 声明的交付物在回合结束后自动发到微信
+- **语音出站**：`/voice` 把工作区内的 `.silk`、`.wav` 等音频转成微信原生语音条；其他格式有 `ffmpeg` 时自动转码，转换或协议发送失败时降级为普通音频文件
 - **登录白名单**：扫码者自动写入 allowlist，其他微信用户默认拒绝
 - **多账号隔离**：按 `accountId + userId` 隔离会话
 - **不阻塞长轮询**：Agent 在后台运行，微信通道可以继续收消息、处理审批和多用户请求
@@ -225,10 +228,19 @@ dsh web
 | `/workspace here` | 查看当前会话的工作区 |
 | `/model` | 查看当前模型和可用模型列表 |
 | `/model <序号\|provider/model\|default>` | 切换当前会话模型；`default` 恢复默认模型 |
+| `/goal` | 查看当前目标、状态、轮次和自动继续状态 |
+| `/goal <目标>` | 直接创建目标并启用自动继续；同名别名 `/target`、`/目标` |
+| `/goal edit <目标>` | 修改当前目标 |
+| `/goal pause` / `/goal resume` | 暂停 / 恢复自动继续 |
+| `/goal complete` | 标记目标完成 |
+| `/goal block <原因>` | 把当前目标标记为阻塞 |
+| `/goal rounds <轮数>` | 修改自动继续轮数上限 |
+| `/goal clear` | 清除当前目标记录 |
 | `/status` | 查看账号、当前会话、模型、Agent 状态 |
 | `/stop` | 停止当前任务 |
 | `/whoami` | 查看账号 / 用户 / 当前会话 id |
-| `/send <路径>` | 发送当前工作区内文件（realpath 防越界） |
+| `/send <路径> [说明]` | 发送当前工作区内图片/文件/视频（realpath 防越界，支持带引号路径） |
+| `/voice <路径> [说明]` | 把工作区内音频转成微信原生语音条；失败时降级为音频文件 |
 | `/approve` / `/reject` | 同意 / 拒绝当前工具审批 |
 | `/help` | 显示帮助 |
 
@@ -246,7 +258,35 @@ dsh web
 /title 项目 A
 /model 1
 /status
+/goal 修复所有失败的测试并提交
+/goal
 ```
+
+### 目标模式
+
+微信里的普通消息会以 `source.kind = clawbot` 进入 DSH，因此模型不能通过 `create_goal` 工具自己创建目标——该工具只接受顶层会话中的直接人类消息。`/goal` 指令绕开模型，直接调用 `ctx.goals.create()`，所以能稳定创建目标：
+
+```text
+/goal 修复所有失败的测试并提交
+```
+
+创建后 DSH 的 goal-round-driver 会自动继续执行。每一轮结束、出错或完成时，结果都会以「【目标 · 第 N 轮】」推回微信；如果模型额度不足等错误导致自动继续被暂停，消息里会提示发送 `/goal resume` 恢复。
+
+### 出站图片、文件、视频和语音
+
+三种发送方式：
+
+```text
+/send 报告.pdf 这是最终报告
+/send "output/屏幕截图.png"
+/voice voice.mp3 听一下这段
+```
+
+- `/send` 按扩展名自动走腾讯插件的图片、视频或文件消息；路径必须在当前工作区内。
+- `/voice` 走原生微信语音消息（`VOICE` item）：`.silk` 直接使用；`.wav` 由内置 `silk-wasm` 编码为 16 kHz SILK；`.mp3`、`.ogg`、`.m4a` 等格式需要系统安装 `ffmpeg` 才能转码。编码或协议发送失败时自动降级成音频文件发送。
+- 模型在回合内调用 `present` 声明文件时，回合结束后会自动通过微信发送。工作区内的音频会优先尝试语音；其他文件按图片/视频/文件发送。
+- 目前没有 TTS：语音发送的是已有音频文件，不会把文字自动合成语音。
+- 微信 iLink 对第三方机器人出站语音条存在客户端侧限制，个别账号可能出现 API 返回成功但微信不渲染语音条的情况；需要确保收到音频时请用 `/send` 发送音频文件。
 
 ### 会话与工作区的持久化
 
@@ -284,6 +324,7 @@ DSH 的 sandbox / 写权限根目录绑定 Session 创建时的 `cwd`，所以 `
     approvalTimeoutMs: 300000
     idleAgentTimeoutMs: 1800000
     replyProgress: true
+    goalProgress: true
     autoStart: true
     debug: false
     botAgent: DSH-ClawBot/0.1
@@ -304,6 +345,7 @@ DSH 的 sandbox / 写权限根目录绑定 Session 创建时的 `cwd`，所以 `
 | `approvalTimeoutMs` | `300000` | 微信审批等待时间，超时按拒绝处理 |
 | `idleAgentTimeoutMs` | `1800000` | 空闲 Agent 回收时间；`0` 关闭。会话历史保留，下条消息自动 resume |
 | `replyProgress` | `true` | 是否允许腾讯插件的进度消息能力 |
+| `goalProgress` | `true` | 是否把目标模式每一轮的执行结果推回微信；关闭后目标仍会运行，但微信不显示中间轮次 |
 | `autoStart` | `true` | 插件加载时自动启动已登录账号 |
 | `debug` | `false` | 开启 `/api/dsh-clawbot/debug/inbound` 本地调试接口 |
 | `botAgent` | `DSH-ClawBot/0.1` | iLink 的 `bot_agent` 观测标识 |
@@ -463,6 +505,18 @@ DSH 的 sandbox / 写权限根目录绑定 Session 创建时的 `cwd`。为了�
 ### 模型报 401 / MISSING_CREDENTIAL 怎么办？
 
 这是模型 provider 的凭据问题，不是微信通道问题。去 DSH 的 Models 页重新保存 key，或在 `clawbot` 行配置可用的 `provider` / `model`。
+
+### 为什么在对话里让 DSH 创建目标会失败？
+
+DSH 的 `create_goal` 工具要求当前顶层 turn 中存在直接人类消息（`source.kind = user`）。微信消息由适配器以 `source.kind = clawbot` 注入，所以模型调用该工具会被拒绝。改用 `/goal <目标>` 指令即可，它直接操作 goal 服务，不需要模型和该工具。
+
+### 任务中途失败，为什么以前只显示「已执行：...」？
+
+旧版在收到 `turn/end` 时只检查有没有 assistant 文字，没文字就用工具名兜底，把真正的错误（例如余额不足、限流、超时）吞掉了。现在会优先返回具体错误、错误码和 HTTP 状态，并附带失败前调用过的工具列表。
+
+### 微信里能发图片、文件、视频和语音吗？
+
+能。手动发送用 `/send`（图片/文件/视频）或 `/voice`（语音）；模型调用 `present` 声明交付物后也会自动发送。语音只支持已有音频文件，不支持文字转语音；`.silk`/`.wav` 可直接转换，其他格式需要系统安装 `ffmpeg`。所有发送路径都限制在当前工作区内，防止模型把工作区外的敏感文件外发。
 
 ### 端口 3080 被占用 / 有两个 DSH 进程？
 

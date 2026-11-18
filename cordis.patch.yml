@@ -9,4 +9,5 @@
         agentPreset: standard
         permissionPreset: workspace-write
         replyProgress: true
+        goalProgress: true
         autoStart: true

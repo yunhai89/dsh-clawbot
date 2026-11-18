@@ -181,6 +181,9 @@ importers:
       qrcode:
         specifier: ^1.5.4
         version: 1.5.4
+      silk-wasm:
+        specifier: ^3.7.1
+        version: 3.7.1
 
 packages:
 
@@ -337,6 +340,10 @@ packages:
 
   set-blocking@2.0.0:
     resolution: {integrity: sha512-KiKBS8AnWGEyLzofFfmvKwpdPzqiy16LvQfK3yv/fVH7Bj13/wl3JSR1J+rfgRE9q7xUJK4qvgS8raSOeLUehw==}
+
+  silk-wasm@3.7.1:
+    resolution: {integrity: sha512-mXPwLRtZxrYV3TZx41jMAeKc80wvmyrcXIcs8HctFxK15Ahz2OJQENYhNgEPeCEOdI6Mbx1NxQsqxzwc3DKerw==}
+    engines: {node: '>=16.11.0'}
 
   string-width@4.2.3:
     resolution: {integrity: sha512-wKyQRQpjJ0sIp62ErSZdGsjMJWsap5oRNihHhu6G7JVO/9jIB6UyevL+tXuOqrng8j/cxKTWyWUwvSTriiZz/g==}
@@ -498,6 +505,8 @@ snapshots:
   require-main-filename@2.0.0: {}
 
   set-blocking@2.0.0: {}
+
+  silk-wasm@3.7.1: {}
 
   string-width@4.2.3:
     dependencies:

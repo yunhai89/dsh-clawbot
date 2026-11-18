@@ -28,6 +28,7 @@ function normalizeConfig(input = {}) {
       : [],
     allowAllUsers: input.allowAllUsers === true,
     replyProgress: input.replyProgress !== false,
+    goalProgress: input.goalProgress !== false,
     autoStart: input.autoStart !== false,
     approvalTimeoutMs: input.approvalTimeoutMs,
     idleAgentTimeoutMs:

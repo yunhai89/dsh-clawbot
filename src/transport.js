@@ -29,6 +29,7 @@ import crypto from 'node:crypto';
  * @property {string} userId
  * @property {string} [text]
  * @property {string} [mediaPath]
+ * @property {string} [voicePath]  Local audio path sent as a native WeChat voice item.
  *
  * @typedef {object} LoginStartResult
  * @property {string} qrcode
